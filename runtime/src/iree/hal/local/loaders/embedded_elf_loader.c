@@ -9,6 +9,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include "iree/hal/api.h"
 #include "iree/hal/local/elf/elf_module.h"
@@ -137,10 +138,18 @@ static iree_status_t iree_hal_elf_executable_create(
   iree_status_t status = iree_elf_module_initialize_from_memory(
       executable_params->executable_data, /*import_table=*/NULL, host_allocator,
       &executable->module);
+  if (!iree_status_is_ok(status)) {
+    fprintf(stderr, "[baremetal] embedded_elf: initialize_from_memory failed code=%d\n",
+            (int)iree_status_code(status));
+  }
 
   // Query metadata and get the entry point function pointers.
   if (iree_status_is_ok(status)) {
     status = iree_hal_elf_executable_query_library(executable);
+    if (!iree_status_is_ok(status)) {
+      fprintf(stderr, "[baremetal] embedded_elf: query_library failed code=%d\n",
+              (int)iree_status_code(status));
+    }
   }
 
   // Resolve imports, if any.
@@ -150,12 +159,20 @@ static iree_status_t iree_hal_elf_executable_create(
         &executable->library.v0->imports,
         (iree_hal_executable_import_thunk_v0_t)iree_elf_thunk_i_ppp,
         host_allocator);
+    if (!iree_status_is_ok(status)) {
+      fprintf(stderr, "[baremetal] embedded_elf: initialize_imports failed code=%d\n",
+              (int)iree_status_code(status));
+    }
   }
 
   // Verify that the library matches the executable params.
   if (iree_status_is_ok(status)) {
     status = iree_hal_executable_library_verify(executable_params,
                                                 executable->library.v0);
+    if (!iree_status_is_ok(status)) {
+      fprintf(stderr, "[baremetal] embedded_elf: library_verify failed code=%d\n",
+              (int)iree_status_code(status));
+    }
   }
 
   // Publish the executable sources with the tracing infrastructure.
