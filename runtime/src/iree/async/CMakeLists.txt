@@ -52,8 +52,6 @@ iree_cc_library(
     "address.c"
     "address_generic.c"
     "address_impl.h"
-    "address_posix.c"
-    "address_win32.c"
     "buffer_pool.c"
     "event.c"
     "file.c"
@@ -66,7 +64,6 @@ iree_cc_library(
     "region.c"
     "semaphore.c"
     "slab.c"
-    "socket.c"
   DEPS
     ::types
     iree::base
@@ -76,6 +73,14 @@ iree_cc_library(
     iree::base::threading
   PUBLIC
 )
+
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  target_sources(iree_async_async PRIVATE
+    "address_posix.c"
+    "address_win32.c"
+    "socket.c"
+  )
+endif()
 
 iree_cc_library(
   NAME
@@ -102,6 +107,8 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
   list(APPEND _platform_platform_deps iree::async::platform::iocp)
 elseif(IREE_ARCH STREQUAL "wasm_32")
   list(APPEND _platform_platform_deps iree::async::platform::js::proactor)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  list(APPEND _platform_platform_deps iree::async::platform::generic)
 else()
   list(APPEND _platform_platform_deps iree::async::platform::posix)
 endif()

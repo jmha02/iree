@@ -10,9 +10,10 @@
 #include "iree/async/platform/io_uring/api.h"
 #endif  // IREE_PLATFORM_LINUX && !IREE_PLATFORM_ANDROID
 
-#if !defined(IREE_PLATFORM_WINDOWS) && !defined(IREE_PLATFORM_WASM)
+#if !defined(IREE_PLATFORM_WINDOWS) && !defined(IREE_PLATFORM_WASM) && \
+    !defined(IREE_PLATFORM_GENERIC)
 #include "iree/async/platform/posix/api.h"
-#endif  // !IREE_PLATFORM_WINDOWS && !IREE_PLATFORM_WASM
+#endif  // !IREE_PLATFORM_WINDOWS && !IREE_PLATFORM_WASM && !IREE_PLATFORM_GENERIC
 
 #if defined(IREE_PLATFORM_WINDOWS)
 #include "iree/async/platform/iocp/api.h"
@@ -21,6 +22,10 @@
 #if defined(IREE_PLATFORM_WASM)
 #include "iree/async/platform/js/proactor.h"
 #endif  // IREE_PLATFORM_WASM
+
+#if defined(IREE_PLATFORM_GENERIC)
+#include "iree/async/platform/generic/api.h"
+#endif  // IREE_PLATFORM_GENERIC
 
 iree_status_t iree_async_proactor_create_platform(
     iree_async_proactor_options_t options, iree_allocator_t allocator,
@@ -31,7 +36,11 @@ iree_status_t iree_async_proactor_create_platform(
 
   iree_status_t status = iree_status_from_code(IREE_STATUS_UNAVAILABLE);
 
-#if defined(IREE_PLATFORM_WINDOWS)
+#if defined(IREE_PLATFORM_GENERIC)
+
+  status = iree_async_proactor_create_generic(options, allocator, out_proactor);
+
+#elif defined(IREE_PLATFORM_WINDOWS)
 
   status = iree_async_proactor_create_iocp(options, allocator, out_proactor);
 

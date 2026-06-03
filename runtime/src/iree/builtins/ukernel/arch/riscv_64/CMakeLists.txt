@@ -128,10 +128,20 @@ iree_select_compiler_opts(IREE_UK_COPTS_RISCV_64_ZVFH
 check_cxx_compiler_flag("${IREE_UK_COPTS_RISCV_64_V}" IREE_UK_BUILD_RISCV_64_V)
 check_cxx_compiler_flag("${IREE_UK_COPTS_RISCV_64_ZVFH}" IREE_UK_BUILD_RISCV_64_ZVFH)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  # The baremetal RISC-V toolchain used by the Spike/static runner can compile
+  # the feature probe but fails on the half-vector intrinsic source variants.
+  # PAFKIP is FP32-only here, so keep the RVV FP32 ukernel path and omit ZVFH.
+  set(IREE_UK_BUILD_RISCV_64_ZVFH OFF)
+endif()
+
 # CPU features that we will try checking compiler support for, unless
 # we set them to OFF below.
 
 set(IREE_UK_TRY_RISCV_64_ZVFHMIN ON)
+if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  set(IREE_UK_TRY_RISCV_64_ZVFHMIN OFF)
+endif()
 
 # Compiler emits '__extendhfsf2' call for the
 # C code below. So, the following test checks whether

@@ -40,6 +40,20 @@ iree_cc_library(
   PUBLIC
 )
 
+set(_thread_platform_deps ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  set(_thread_platform_deps "")
+endif()
+set(_thread_platform_srcs
+  "thread.c"
+  "thread_darwin.c"
+  "thread_pthreads.c"
+  "thread_win32.c"
+)
+if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  list(APPEND _thread_platform_srcs "thread_generic.c")
+endif()
+
 iree_cc_library(
   NAME
     thread
@@ -47,12 +61,9 @@ iree_cc_library(
     "thread.h"
     "thread_impl.h"
   SRCS
-    "thread.c"
-    "thread_darwin.c"
-    "thread_pthreads.c"
-    "thread_win32.c"
+    ${_thread_platform_srcs}
   DEPS
-    ${CMAKE_DL_LIBS}
+    ${_thread_platform_deps}
     ::threading
     iree::base
     iree::base::core_headers

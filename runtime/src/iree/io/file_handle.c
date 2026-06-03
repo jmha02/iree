@@ -21,8 +21,10 @@
 
 #else
 
-#include <fcntl.h>     // open
+#include <fcntl.h>  // open
+#if !defined(IREE_PLATFORM_GENERIC)
 #include <sys/mman.h>  // mmap
+#endif  // !IREE_PLATFORM_GENERIC
 #include <sys/stat.h>  // fstat
 #include <unistd.h>    // fsync
 
@@ -147,6 +149,9 @@ static iree_status_t iree_io_platform_fd_flush(int fd) {
 
 #if defined(IREE_PLATFORM_WINDOWS)
   int ret = _commit(fd);
+#elif defined(IREE_PLATFORM_GENERIC)
+  (void)fd;
+  int ret = 0;
 #else
   int ret = fsync(fd);
 #endif  // IREE_PLATFORM_WINDOWS
@@ -337,7 +342,9 @@ static iree_status_t iree_io_file_handle_platform_open(
 
   int flags = 0;
   // TODO(benvanik): add a flag for forking behavior.
+#if defined(O_CLOEXEC)
   flags |= O_CLOEXEC;
+#endif  // O_CLOEXEC
   if (iree_all_bits_set(mode, IREE_IO_FILE_MODE_OVERWRITE)) {
     // If the file exists open anyway and truncate as if it had been recreated.
     // This matches Win32 CREATE_ALWAYS behavior.
@@ -378,12 +385,16 @@ static iree_status_t iree_io_file_handle_platform_open(
   if (iree_all_bits_set(mode, IREE_IO_FILE_MODE_OVERWRITE)) {
     // Zero-extend the file up to the total file size specified by the
     // caller. Note that `ftruncate` extends too.
+#if defined(IREE_PLATFORM_GENERIC)
+    (void)initial_size;
+#else
     if (ftruncate(fd, (off_t)initial_size) == -1) {
       return iree_make_status(iree_status_code_from_errno(errno),
                               "failed to extend file '%.*s' to %" PRIu64
                               " bytes (out of disk space or permission denied)",
                               (int)path.size, path.data, initial_size);
     }
+#endif  // IREE_PLATFORM_GENERIC
   }
 
   out_handle_primitive->type = IREE_IO_FILE_HANDLE_TYPE_FD;
@@ -397,7 +408,11 @@ IREE_API_EXPORT iree_status_t iree_io_file_handle_platform_open_fd(
   IREE_ASSERT_ARGUMENT(out_handle_primitive);
   memset(out_handle_primitive, 0, sizeof(*out_handle_primitive));
 
+#if defined(IREE_PLATFORM_GENERIC)
+  int new_fd = fd;
+#else
   int new_fd = dup(fd);
+#endif  // IREE_PLATFORM_GENERIC
 
   if (new_fd == -1) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT,

@@ -232,16 +232,27 @@ iree_cc_test(
     iree::testing::gtest_main
 )
 
+set(_dynamic_library_platform_deps ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  set(_dynamic_library_platform_deps "")
+endif()
+set(_dynamic_library_platform_srcs
+  "dynamic_library_posix.c"
+  "dynamic_library_win32.c"
+)
+if(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+  list(APPEND _dynamic_library_platform_srcs "dynamic_library_generic.c")
+endif()
+
 iree_cc_library(
   NAME
     dynamic_library
   HDRS
     "dynamic_library.h"
   SRCS
-    "dynamic_library_posix.c"
-    "dynamic_library_win32.c"
+    ${_dynamic_library_platform_srcs}
   DEPS
-    ${CMAKE_DL_LIBS}
+    ${_dynamic_library_platform_deps}
     ::internal
     ::path
     iree::base

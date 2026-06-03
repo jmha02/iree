@@ -10,6 +10,10 @@
 #include "iree/io/stdio_util.h"
 #endif  // IREE_FILE_IO_ENABLE
 
+#if defined(IREE_PLATFORM_GENERIC) && IREE_FILE_IO_ENABLE
+extern FILE* fdopen(int fd, const char* mode);
+#endif  // IREE_PLATFORM_GENERIC && IREE_FILE_IO_ENABLE
+
 //===----------------------------------------------------------------------===//
 // iree_io_file_contents_t
 //===----------------------------------------------------------------------===//
@@ -149,6 +153,9 @@ static iree_status_t iree_io_file_handle_fdopen(iree_io_file_handle_t* handle,
   }
   int fd = iree_io_file_handle_primitive(handle).value.fd;
 
+#if defined(IREE_PLATFORM_GENERIC)
+  int dup_fd = fd;
+#else
   // Duplicate the file descriptor so that we have our own copy of the seek
   // position. The initial position will be preserved.
   int dup_fd = iree_dup(fd);
@@ -158,6 +165,7 @@ static iree_status_t iree_io_file_handle_fdopen(iree_io_file_handle_t* handle,
         "unable to duplicate file descriptor; possibly out of file descriptors "
         "(see ulimit)");
   }
+#endif  // IREE_PLATFORM_GENERIC
 
   // NOTE: after this point the file handle is associated with dup_fd and
   // anything we do to it (like closing) will apply to the dup_fd.
@@ -174,7 +182,7 @@ static iree_status_t iree_io_file_handle_fdopen(iree_io_file_handle_t* handle,
     if (file) {
       // NOTE: closes the dup_fd.
       fclose(file);
-    } else if (dup_fd > 0) {
+    } else if (dup_fd > 0 && dup_fd != fd) {
       iree_close(dup_fd);
     }
   }

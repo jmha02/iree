@@ -14,10 +14,10 @@
 
 // The thread runner is available on platforms with C threading support.
 // On wasm, the JS event loop drives proactors — no runner needed.
-#if !IREE_PLATFORM_WASM
+#if !IREE_PLATFORM_WASM && !IREE_PLATFORM_GENERIC
 #include "iree/async/util/proactor_thread_runner.h"
 #define IREE_ASYNC_PROACTOR_POOL_HAVE_RUNNER_THREAD 1
-#endif  // !IREE_PLATFORM_WASM
+#endif  // !IREE_PLATFORM_WASM && !IREE_PLATFORM_GENERIC
 
 //===----------------------------------------------------------------------===//
 // iree_async_proactor_pool_options_default

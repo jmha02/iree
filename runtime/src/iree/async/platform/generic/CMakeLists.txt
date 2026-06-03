@@ -1,0 +1,13 @@
+iree_cc_library(
+  NAME
+    generic
+  HDRS
+    "api.h"
+  SRCS
+    "proactor.c"
+  DEPS
+    iree::async
+    iree::base
+    iree::base::internal
+  PUBLIC
+)

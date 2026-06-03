@@ -49,9 +49,11 @@ iree_cc_library(
 
 ### BAZEL_TO_CMAKE_PRESERVES_ALL_CONTENT_BELOW_THIS_LINE ###
 
-iree_cc_unified_library(
-  NAME
-    unified
-  ROOT
-    ::impl
-)
+if(IREE_ENABLE_THREADING)
+  iree_cc_unified_library(
+    NAME
+      unified
+    ROOT
+      ::impl
+  )
+endif()

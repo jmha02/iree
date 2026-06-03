@@ -107,9 +107,10 @@ static iree_status_t iree_tooling_create_run_context(
   // Load all modules specified by --module= flags.
   iree_tooling_module_list_t module_list;
   iree_tooling_module_list_initialize(&module_list);
-  IREE_RETURN_IF_ERROR(iree_tooling_load_modules_from_flags(
-                           instance, host_allocator, &module_list),
-                       "loading modules and dependencies");
+  iree_status_t load_modules_status =
+      iree_tooling_load_modules_from_flags(instance, host_allocator,
+                                           &module_list);
+  IREE_RETURN_IF_ERROR(load_modules_status, "loading modules and dependencies");
 
   // Load the optional bytecode module from the provided flatbuffer data.
   // Note that we do this after all other --module= flags are processed so that

@@ -11,6 +11,10 @@
 
 #include "iree/io/stdio_util.h"
 
+#if defined(IREE_PLATFORM_GENERIC) && IREE_FILE_IO_ENABLE
+extern FILE* fdopen(int fd, const char* mode);
+#endif  // IREE_PLATFORM_GENERIC && IREE_FILE_IO_ENABLE
+
 //===----------------------------------------------------------------------===//
 // iree_io_stdio_stream_t
 //===----------------------------------------------------------------------===//
@@ -172,6 +176,9 @@ IREE_API_EXPORT iree_status_t iree_io_stdio_stream_open_fd(
   *out_stream = NULL;
   IREE_TRACE_ZONE_BEGIN(z0);
 
+#if defined(IREE_PLATFORM_GENERIC)
+  int dup_fd = fd;
+#else
   // Duplicate the file descriptor so that we have our own copy of the seek
   // position. The initial position will be preserved.
   int dup_fd = iree_dup(fd);
@@ -181,6 +188,7 @@ IREE_API_EXPORT iree_status_t iree_io_stdio_stream_open_fd(
         "unable to duplicate file descriptor; possibly out of file descriptors "
         "(see ulimit)");
   }
+#endif  // IREE_PLATFORM_GENERIC
 
   iree_io_stream_mode_t stream_mode = IREE_IO_STREAM_MODE_SEEKABLE;
   if (iree_all_bits_set(mode, IREE_IO_STDIO_STREAM_MODE_READ)) {
@@ -218,7 +226,7 @@ IREE_API_EXPORT iree_status_t iree_io_stdio_stream_open_fd(
     } else if (handle) {
       // NOTE: closes the dup_fd.
       fclose(handle);
-    } else if (dup_fd > 0) {
+    } else if (dup_fd > 0 && dup_fd != fd) {
       iree_close(dup_fd);
     }
   }

@@ -7,6 +7,7 @@
 # Special case package namespace for tools/ -> "" (empty string)
 # For example, tools/iree-compile -> iree-compile (no namespace)
 set(IREE_PACKAGE_ROOT_DIR "${CMAKE_CURRENT_LIST_DIR}")
+option(IREE_BUILD_STATIC_RUN_MODULE "Build the static-run-module tool" ON)
 
 # Tools IREE provides for compiling, executing, and benchmarking programs, as
 # well as other utilities.
@@ -57,6 +58,35 @@ endif()
 set(IREE_PACKAGE_ROOT_PREFIX "iree/tools")
 iree_add_all_subdirs()
 set(IREE_PACKAGE_ROOT_PREFIX "")
+
+# Static runtime binary for RISC-V targets. This is intentionally available
+# before the threading gate so pk/baremetal-style runtime builds can execute
+# VMFBs without dynamic loading or driver auto-registration.
+if(IREE_BUILD_STATIC_RUN_MODULE)
+  iree_cc_binary(
+    NAME
+      static-run-module
+    SRCS
+      "static-run-module.c"
+    DEPS
+      iree::base
+      iree::base::tooling::flags
+      iree::hal
+      iree::hal::drivers::local_sync::registration
+      iree::hal::local::loaders::registration
+      iree::hal::local::plugins::registration
+      iree::modules::hal
+      iree::tooling::context_util
+      iree::tooling::run_module
+      iree::vm
+    INSTALL_COMPONENT IREETools-Runtime
+    COPTS
+      -DIREE_TOOLING_ENABLE_DYNAMIC_LIBRARY_LOADING=0
+      -DIREE_TOOLING_ENABLE_DRIVER_AUTO_REGISTRATION=0
+    LINKOPTS
+      -static
+  )
+endif()
 
 # TODO(#6353): Tools has thread dependencies in gtest, benchmark, yaml, etc.
 # This should be split between runtime/compiler with optional threading support.

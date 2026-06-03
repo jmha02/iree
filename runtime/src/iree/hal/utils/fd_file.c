@@ -187,7 +187,15 @@ static iree_status_t iree_hal_platform_fd_pread(
   // Cap at INT_MAX: some kernels return -EINVAL for counts exceeding this.
   // Callers retry for the remaining bytes via out_bytes_read.
   if (count > INT_MAX) count = INT_MAX;
+#if defined(IREE_PLATFORM_GENERIC)
+  if (lseek(fd, (off_t)offset, SEEK_SET) == -1) {
+    return iree_make_status(iree_status_code_from_errno(errno),
+                            "failed to seek before read");
+  }
+  ssize_t bytes_read = read(fd, buffer, (size_t)count);
+#else
   ssize_t bytes_read = pread(fd, buffer, (size_t)count, (off_t)offset);
+#endif  // IREE_PLATFORM_GENERIC
   if (bytes_read > 0) {
     *out_bytes_read = (iree_host_size_t)bytes_read;
     return iree_ok_status();
@@ -208,7 +216,15 @@ static iree_status_t iree_hal_platform_fd_pwrite(
   // Cap at INT_MAX: some kernels return -EINVAL for counts exceeding this.
   // Callers retry for the remaining bytes via out_bytes_written.
   if (count > INT_MAX) count = INT_MAX;
+#if defined(IREE_PLATFORM_GENERIC)
+  if (lseek(fd, (off_t)offset, SEEK_SET) == -1) {
+    return iree_make_status(iree_status_code_from_errno(errno),
+                            "failed to seek before write");
+  }
+  ssize_t bytes_written = write(fd, buffer, (size_t)count);
+#else
   ssize_t bytes_written = pwrite(fd, buffer, (size_t)count, (off_t)offset);
+#endif  // IREE_PLATFORM_GENERIC
   if (bytes_written > 0) {
     *out_bytes_written = (iree_host_size_t)bytes_written;
     return iree_ok_status();

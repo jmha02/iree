@@ -380,14 +380,14 @@ static iree_status_t iree_tooling_load_hal_async_module(
 
   // Create a proactor pool for async I/O on the device(s).
   iree_async_proactor_pool_t* proactor_pool = NULL;
-  IREE_RETURN_AND_END_ZONE_IF_ERROR(
-      z0, iree_async_proactor_pool_create(
-              iree_numa_node_count(), /*node_ids=*/NULL,
-              iree_async_proactor_pool_options_default(), host_allocator,
-              &proactor_pool));
+  iree_status_t status = iree_async_proactor_pool_create(
+      iree_numa_node_count(), /*node_ids=*/NULL,
+      iree_async_proactor_pool_options_default(), host_allocator,
+      &proactor_pool);
+  IREE_RETURN_AND_END_ZONE_IF_ERROR(z0, status);
 
   iree_async_frontier_tracker_t* frontier_tracker = NULL;
-  iree_status_t status = iree_async_frontier_tracker_create(
+  status = iree_async_frontier_tracker_create(
       iree_async_frontier_tracker_options_default(), host_allocator,
       &frontier_tracker);
 
@@ -400,9 +400,16 @@ static iree_status_t iree_tooling_load_hal_async_module(
   create_params.proactor_pool = proactor_pool;
   iree_hal_device_list_t* device_list = NULL;
   if (iree_status_is_ok(status)) {
+#if defined(IREE_PLATFORM_GENERIC)
+    iree_hal_driver_registry_t* driver_registry =
+        iree_hal_driver_registry_default();
+#else
+    iree_hal_driver_registry_t* driver_registry =
+        iree_hal_available_driver_registry();
+#endif  // IREE_PLATFORM_GENERIC
     status = iree_hal_create_devices_from_flags(
-        iree_hal_available_driver_registry(), default_device_uri,
-        &create_params, host_allocator, &device_list);
+        driver_registry, default_device_uri, &create_params, host_allocator,
+        &device_list);
   }
   iree_async_proactor_pool_release(proactor_pool);
   if (!iree_status_is_ok(status)) {
@@ -711,10 +718,11 @@ static iree_status_t iree_tooling_resolve_module_dependency_callback(
   // but it could be in the future.
   iree_vm_module_t* module = NULL;
   if (iree_string_view_equal(dependency->name, IREE_SV("hal"))) {
-    IREE_RETURN_IF_ERROR(iree_tooling_load_hal_async_module(
+    iree_status_t dep_status = iree_tooling_load_hal_async_module(
         state->instance, state->default_device_uri, state->host_allocator,
         &module, &state->device_list, &state->device_allocator,
-        &state->replay_recorder));
+        &state->replay_recorder);
+    IREE_RETURN_IF_ERROR(dep_status);
   } else if (iree_string_view_equal(dependency->name, IREE_SV("hal_inline"))) {
     IREE_RETURN_IF_ERROR(iree_tooling_load_hal_inline_module(
         state->instance, state->host_allocator, &module,
