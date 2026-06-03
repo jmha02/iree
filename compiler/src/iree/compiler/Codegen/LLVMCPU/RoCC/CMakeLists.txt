@@ -1,0 +1,50 @@
+iree_add_all_subdirs()
+
+iree_tablegen_library(
+  NAME
+    RoCCPassesIncGen
+  TD_FILE
+    "Passes.td"
+  OUTS
+    --gen-pass-decls Passes.h.inc
+)
+
+iree_cc_library(
+  NAME
+    RoCCPassHeaders
+  HDRS
+    "Passes.h"
+    "Passes.h.inc"
+  DEPS
+    ::RoCCPassesIncGen
+    MLIRPass
+  PUBLIC
+)
+
+iree_cc_library(
+  NAME
+    RoCCPasses
+  HDRS
+    "FlexiNPUFuncImpl.h"
+    "Passes.h"
+  SRCS
+    "FlexiNPUConvertToFunctionCall.cpp"
+    "FlexiNPUTensorize.cpp"
+    "Passes.cpp"
+  DEPS
+    ::RoCCPassHeaders
+    ::RoCCPassesIncGen
+    LLVMSupport
+    MLIRArithDialect
+    MLIRDialectUtils
+    MLIRFuncDialect
+    MLIRIR
+    MLIRLinalgDialect
+    MLIRMemRefDialect
+    MLIRPass
+    MLIRSCFDialect
+    MLIRTransforms
+    iree::compiler::Codegen::LLVMCPU::RoCC::Utils
+    iree::compiler::Dialect::FlexiNPU::IR
+  PUBLIC
+)

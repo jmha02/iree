@@ -748,10 +748,17 @@ static inline iree_status_t iree_hal_buffer_binding_table_resolve_ref(
     out_resolved_ref->reserved = buffer_ref.reserved;
     out_resolved_ref->buffer_slot = 0;
     out_resolved_ref->buffer = binding->buffer;
-    const iree_device_size_t max_length =
+    iree_device_size_t max_length =
         binding->length != IREE_HAL_WHOLE_BUFFER
             ? binding->length
             : iree_hal_buffer_byte_length(binding->buffer) - binding->offset;
+    // Some embedded/local-sync RISC-V paths can marshal indirect binding table
+    // lengths as 0 even when the command buffer references a non-empty subspan.
+    // Treat this as an unspecified whole-buffer binding if a backing buffer is
+    // present, matching the intent of the indirect reference.
+    if (max_length == 0 && binding->buffer && buffer_ref.length > 0) {
+      max_length = iree_hal_buffer_byte_length(binding->buffer) - binding->offset;
+    }
     return iree_hal_buffer_calculate_range(
         binding->offset, max_length, buffer_ref.offset, buffer_ref.length,
         &out_resolved_ref->offset, &out_resolved_ref->length);

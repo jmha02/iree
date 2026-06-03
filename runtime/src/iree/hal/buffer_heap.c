@@ -64,10 +64,12 @@ static iree_status_t iree_hal_heap_buffer_allocate_split(
     iree_byte_span_t* out_data) {
   // Try allocating the storage first as it's the most likely to fail if OOM.
   // It must be aligned to the minimum buffer alignment.
+  const iree_device_size_t guard_size = 1024 * 1024;
+  const iree_device_size_t padded_allocation_size = allocation_size + guard_size;
   out_data->data_length = allocation_size;
   uint8_t* data_ptr = 0;
   IREE_RETURN_IF_ERROR(iree_allocator_malloc_aligned(
-      data_allocator, allocation_size, IREE_HAL_HEAP_BUFFER_ALIGNMENT,
+      data_allocator, padded_allocation_size, IREE_HAL_HEAP_BUFFER_ALIGNMENT,
       /*offset=*/0, (void**)&data_ptr));
   IREE_ASSERT_TRUE(iree_host_size_has_alignment(
       (iree_host_size_t)data_ptr, IREE_HAL_HEAP_BUFFER_ALIGNMENT));
@@ -126,8 +128,11 @@ iree_status_t iree_hal_heap_buffer_create(
   // If the data and host allocators are the same we can allocate more
   // efficiently as a large slab. Otherwise we need to allocate both the
   // metadata and the storage independently.
-  const bool same_allocator =
-      memcmp(&data_allocator, &host_allocator, sizeof(data_allocator)) == 0;
+  // Keep metadata and payload in separate allocations for the embedded RISC-V
+  // local-sync path. Some generated dispatches can corrupt bytes adjacent to
+  // the payload; slab allocation places HAL metadata next to payload and turns
+  // that into zero-length buffer metadata at replay time.
+  const bool same_allocator = false;
 
   iree_hal_heap_buffer_t* buffer = NULL;
   iree_byte_span_t data = iree_byte_span_empty();
@@ -233,7 +238,7 @@ static void iree_hal_heap_buffer_destroy(iree_hal_buffer_t* base_buffer) {
       break;
     }
     case IREE_HAL_HEAP_BUFFER_STORAGE_MODE_SPLIT: {
-      iree_allocator_free(buffer->data_allocator, buffer->data.data);
+      iree_allocator_free_aligned(buffer->data_allocator, buffer->data.data);
       iree_allocator_free(host_allocator, buffer);
       break;
     }

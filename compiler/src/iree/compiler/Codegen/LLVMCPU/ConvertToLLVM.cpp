@@ -13,6 +13,7 @@
 #include "iree/compiler/Codegen/LLVMCPU/Utils.h"
 #include "iree/compiler/Codegen/Utils/CPUUtils.h"
 #include "iree/compiler/Codegen/Utils/Utils.h"
+#include "iree/compiler/Dialect/FlexiNPU/IR/FlexiNPUDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
 #include "iree/compiler/Dialect/Util/IR/UtilDialect.h"
@@ -1006,6 +1007,118 @@ public:
   }
 };
 
+class FlexiNPUDummyMemrefToLLVMPattern
+    : public ConvertOpToLLVMPattern<flexinpu::DummyMemrefOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      flexinpu::DummyMemrefOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(flexinpu::DummyMemrefOp dummyOp,
+                  flexinpu::DummyMemrefOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = dummyOp.getLoc();
+    Value valueOperand = adaptor.getValue();
+    int64_t dummyValue = 0;
+    if (auto constOp = valueOperand.getDefiningOp<LLVM::ConstantOp>()) {
+      auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
+      if (!intAttr) {
+        return rewriter.notifyMatchFailure(
+            dummyOp, "dummy_memref value operand must be an integer constant");
+      }
+      dummyValue = intAttr.getInt();
+    } else if (auto constOp = valueOperand.getDefiningOp<arith::ConstantOp>()) {
+      auto intAttr = dyn_cast<IntegerAttr>(constOp.getValue());
+      if (!intAttr) {
+        return rewriter.notifyMatchFailure(
+            dummyOp, "dummy_memref value operand must be an integer constant");
+      }
+      dummyValue = intAttr.getInt();
+    } else {
+      return rewriter.notifyMatchFailure(dummyOp,
+                                         "dummy_memref value must be constant");
+    }
+
+    auto memrefType = cast<MemRefType>(dummyOp.getResult().getType());
+    Type llvmMemrefType = getTypeConverter()->convertType(memrefType);
+    if (!llvmMemrefType) {
+      return rewriter.notifyMatchFailure(dummyOp,
+                                         "failed to convert memref type");
+    }
+
+    auto ptrType = LLVM::LLVMPointerType::get(rewriter.getContext());
+    Type i64Type = rewriter.getI64Type();
+    Value intConstant = rewriter.create<LLVM::ConstantOp>(
+        loc, i64Type, rewriter.getI64IntegerAttr(dummyValue));
+    Value ptr = rewriter.create<LLVM::IntToPtrOp>(loc, ptrType, intConstant);
+    Value zeroOffset = rewriter.create<LLVM::ConstantOp>(
+        loc, i64Type, rewriter.getI64IntegerAttr(0));
+
+    Value memrefStruct = rewriter.create<LLVM::UndefOp>(loc, llvmMemrefType);
+    memrefStruct =
+        rewriter.create<LLVM::InsertValueOp>(loc, memrefStruct, ptr, 0);
+    memrefStruct =
+        rewriter.create<LLVM::InsertValueOp>(loc, memrefStruct, ptr, 1);
+    memrefStruct = rewriter.create<LLVM::InsertValueOp>(
+        loc, memrefStruct, zeroOffset, 2);
+    rewriter.replaceOp(dummyOp, memrefStruct);
+    return success();
+  }
+};
+
+class FlexiNPURoccInstructionToLLVMPattern
+    : public ConvertOpToLLVMPattern<flexinpu::RoccInstructionOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      flexinpu::RoccInstructionOp>::ConvertOpToLLVMPattern;
+
+  LogicalResult
+  matchAndRewrite(flexinpu::RoccInstructionOp roccOp,
+                  flexinpu::RoccInstructionOpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    Location loc = roccOp.getLoc();
+    Value rs1 = adaptor.getRs1();
+    Value rs2 = adaptor.getRs2();
+    Value functValue = adaptor.getFunct();
+
+    Type i64Type = rewriter.getI64Type();
+    if (rs1.getType() != i64Type) {
+      rs1 = rewriter.create<LLVM::ZExtOp>(loc, i64Type, rs1);
+    }
+    if (rs2.getType() != i64Type) {
+      rs2 = rewriter.create<LLVM::ZExtOp>(loc, i64Type, rs2);
+    }
+
+    int32_t funct = 0;
+    if (auto constOp = functValue.getDefiningOp<LLVM::ConstantOp>()) {
+      funct = static_cast<int32_t>(
+          cast<IntegerAttr>(constOp.getValue()).getInt());
+    } else if (auto constOp = functValue.getDefiningOp<arith::ConstantOp>()) {
+      funct = static_cast<int32_t>(
+          cast<IntegerAttr>(constOp.getValue()).getInt());
+    } else {
+      return rewriter.notifyMatchFailure(roccOp,
+                                         "funct operand must be constant");
+    }
+
+    std::string asmStr =
+        ".insn r 0x7b, 0x3, " + std::to_string(funct) + ", x0, $0, $1";
+    rewriter.create<LLVM::InlineAsmOp>(
+        loc, TypeRange{}, ValueRange{rs1, rs2}, StringRef(asmStr),
+        /*constraints=*/StringRef("r,r"),
+        /*has_side_effects=*/true,
+        /*is_align_stack=*/false,
+        /*tail_call_kind=*/LLVM::tailcallkind::TailCallKind::None,
+        /*asm_dialect=*/
+        LLVM::AsmDialectAttr::get(rewriter.getContext(),
+                                  LLVM::AsmDialect::AD_ATT),
+        /*operand_attrs=*/ArrayAttr{});
+
+    rewriter.eraseOp(roccOp);
+    return success();
+  }
+};
+
 class ConvertToLLVMPass
     : public impl::ConvertToLLVMPassBase<ConvertToLLVMPass> {
 public:
@@ -1018,7 +1131,7 @@ public:
                     memref::MemRefDialect, linalg::LinalgDialect,
                     tosa::TosaDialect, scf::SCFDialect, vector::VectorDialect,
                     arm_neon::ArmNeonDialect, arm_sve::ArmSVEDialect,
-                    LLVM::LLVMDialect>();
+                    LLVM::LLVMDialect, flexinpu::FlexiNPUDialect>();
   }
   void runOnOperation() override;
 };
@@ -1154,6 +1267,10 @@ void ConvertToLLVMPass::runOnOperation() {
   if (use32BitImpl) {
     patterns.add<ExpandMulSIExtended>(patterns.getContext(), /*benefit=*/1024);
   }
+  if (targetConfig && hasFlexiNPUFeature(targetConfig)) {
+    patterns.add<FlexiNPUDummyMemrefToLLVMPattern,
+                 FlexiNPURoccInstructionToLLVMPattern>(typeConverter);
+  }
   LLVMConversionTarget target(getContext());
   populateAffineToStdConversionPatterns(patterns);
   populateSCFToControlFlowConversionPatterns(patterns);
@@ -1213,7 +1330,8 @@ void ConvertToLLVMPass::runOnOperation() {
   target.markOpRecursivelyLegal<IREE::Codegen::DispatchConfigOp>();
   target.addIllegalDialect<func::FuncDialect, mlir::arith::ArithDialect,
                            IREE::Util::UtilDialect, IREE::HAL::HALDialect,
-                           math::MathDialect, tosa::TosaDialect>();
+                           math::MathDialect, tosa::TosaDialect,
+                           flexinpu::FlexiNPUDialect>();
 
   if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
     signalPassFailure();

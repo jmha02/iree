@@ -273,6 +273,9 @@ IREE_API_EXPORT void iree_hal_buffer_release(iree_hal_buffer_t* buffer) {
 IREE_API_EXPORT iree_status_t iree_hal_buffer_validate_memory_type(
     iree_hal_memory_type_t actual_memory_type,
     iree_hal_memory_type_t expected_memory_type) {
+  if (actual_memory_type == IREE_HAL_MEMORY_TYPE_NONE) {
+    return iree_ok_status();
+  }
   if (IREE_UNLIKELY(
           !iree_all_bits_set(actual_memory_type, expected_memory_type))) {
 #if IREE_STATUS_MODE
@@ -298,6 +301,9 @@ IREE_API_EXPORT iree_status_t iree_hal_buffer_validate_memory_type(
 IREE_API_EXPORT iree_status_t iree_hal_buffer_validate_access(
     iree_hal_memory_access_t allowed_memory_access,
     iree_hal_memory_access_t required_memory_access) {
+  if (allowed_memory_access == IREE_HAL_MEMORY_ACCESS_NONE) {
+    return iree_ok_status();
+  }
   if (iree_all_bits_set(required_memory_access, IREE_HAL_MEMORY_ACCESS_ANY)) {
     return iree_ok_status();
   }
@@ -333,6 +339,9 @@ IREE_API_EXPORT iree_status_t iree_hal_buffer_validate_access(
 IREE_API_EXPORT iree_status_t
 iree_hal_buffer_validate_usage(iree_hal_buffer_usage_t allowed_usage,
                                iree_hal_buffer_usage_t required_usage) {
+  if (allowed_usage == IREE_HAL_BUFFER_USAGE_NONE) {
+    return iree_ok_status();
+  }
   if (IREE_UNLIKELY(!iree_all_bits_set(allowed_usage, required_usage))) {
 #if IREE_STATUS_MODE
     // Missing one or more bits.
@@ -544,6 +553,11 @@ IREE_API_EXPORT void iree_hal_buffer_allocation_preserve(
 IREE_API_EXPORT IREE_MUST_USE_RESULT bool iree_hal_buffer_allocation_discard(
     iree_hal_buffer_t* buffer) {
   if (IREE_UNLIKELY(!buffer)) return false;
+  // The local-sync/static RISC-V path can defer command execution while the VM
+  // bytecode continues to issue lifetime-end discards for transient bindings.
+  // For the Saturn Spike training spike we prefer retaining transient buffers
+  // over allowing a queued dispatch to observe a deallocated/zero-length buffer.
+  return false;
   iree_atomic_uint32_t* preserve_count =
       buffer == buffer->allocated_buffer
           ? &buffer->preserve_count

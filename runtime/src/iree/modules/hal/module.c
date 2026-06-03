@@ -18,7 +18,7 @@
 
 // Limit the number of bindings we pass down through the HAL. This can be tuned
 // in the future but right now guards the stack from blowing up during calls.
-#define IREE_HAL_MODULE_MAX_DESCRIPTOR_BINDING_COUNT ((iree_host_size_t)32)
+#define IREE_HAL_MODULE_MAX_DESCRIPTOR_BINDING_COUNT ((iree_host_size_t)256)
 
 // Limit the number of bindings in a binding table that we allocate on the stack
 // while marshaling from the VM. Counts over this amount will result in heap
@@ -26,7 +26,7 @@
 // at most a dozen buffers but programs with individually stored parameters may
 // need hundreds or even thousands. Yuck.
 #define IREE_HAL_MODULE_MAX_STACK_COMMAND_BUFFER_BINDING_COUNT \
-  ((iree_host_size_t)64)
+  ((iree_host_size_t)256)
 
 //===----------------------------------------------------------------------===//
 // iree_hal_module_device_policy_t
@@ -1541,6 +1541,18 @@ IREE_VM_ABI_EXPORT(iree_hal_module_device_queue_execute_indirect,  //
     if (!iree_status_is_ok(status)) break;
     bindings[i].offset = iree_hal_cast_device_size(args->a6[i].i1);
     bindings[i].length = iree_hal_cast_device_size(args->a6[i].i2);
+    if (bindings[i].buffer && bindings[i].length > 0 &&
+        iree_hal_buffer_byte_length(bindings[i].buffer) == 0) {
+      fprintf(stderr,
+              "IREE_HAL_ZERO_LENGTH_BINDING index=%" PRIhsz
+              " binding_length=%" PRIdsz " binding_offset=%" PRIdsz
+              " buffer=%p memory_type=0x%x access=0x%x usage=0x%x\n",
+              i, bindings[i].length, bindings[i].offset,
+              (void*)bindings[i].buffer,
+              (unsigned)iree_hal_buffer_memory_type(bindings[i].buffer),
+              (unsigned)iree_hal_buffer_allowed_access(bindings[i].buffer),
+              (unsigned)iree_hal_buffer_allowed_usage(bindings[i].buffer));
+    }
   }
 
   // Schedule execution with the binding table - it will be copied by the device

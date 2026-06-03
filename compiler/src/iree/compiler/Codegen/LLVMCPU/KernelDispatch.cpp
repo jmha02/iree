@@ -1251,6 +1251,52 @@ setMatmulRootConfig(mlir::FunctionOpInterface entryPointFn,
                             CPUPipeline::DoubleTilingExpert));
 }
 
+// Channel-wise tensor reductions of the form [..., C, ...] -> [C] are common
+// in batch-norm forward/backward graphs. Keeping both an outer distribution tile
+// on C and a vector reduction tile on a reduced dimension can produce an
+// intermediate vector<C x K> even though the accumulated slice is vector<K>.
+// The upstream vector lowering then creates an invalid rank-2
+// vector.insert_strided_slice from a rank-1 source. Use a scalar outer
+// distribution tile while preserving the reduction vector tile.
+static bool isSingleOutputDimProjectedReduction(linalg::GenericOp genericOp) {
+  if (genericOp.getNumReductionLoops() < 1) {
+    return false;
+  }
+  if (!cast<linalg::LinalgOp>(genericOp.getOperation())
+           .hasOnlyProjectedPermutations()) {
+    return false;
+  }
+  if (genericOp.getNumDpsInits() != 1) {
+    return false;
+  }
+
+  auto initType =
+      llvm::dyn_cast<ShapedType>(genericOp.getDpsInits()[0].getType());
+  if (!initType || !initType.hasRank()) {
+    return false;
+  }
+  if (initType.getRank() == 1) {
+    return true;
+  }
+  int64_t nonUnitDims = 0;
+  for (int64_t dim : initType.getShape()) {
+    if (ShapedType::isDynamic(dim) || dim != 1) {
+      ++nonUnitDims;
+    }
+  }
+  if (nonUnitDims != 1) {
+    return false;
+  }
+
+  int64_t parallelLoops = 0;
+  for (auto iteratorType : genericOp.getIteratorTypesArray()) {
+    if (iteratorType == utils::IteratorType::parallel) {
+      ++parallelLoops;
+    }
+  }
+  return parallelLoops == 1;
+}
+
 /// Returns default hard-coded vector sizes for a give target. No smartness
 /// should be introduced in this utility.
 static void
@@ -2437,6 +2483,15 @@ setDefaultGenericOpRootConfig(mlir::FunctionOpInterface entryPointFn,
 
   SmallVector<int64_t> distTileSizes =
       getDefaultDistributedLevelTileSizes(genericOp, distConfig);
+  if (isSingleOutputDimProjectedReduction(genericOp)) {
+    auto iteratorTypes = genericOp.getIteratorTypesArray();
+    for (unsigned i = 0; i < numLoops; ++i) {
+      if (iteratorTypes[i] == utils::IteratorType::parallel &&
+          distTileSizes[i] > 1) {
+        distTileSizes[i] = 1;
+      }
+    }
+  }
   LDBG() << "Final tile sizes for distribution: " << distTileSizes;
 
   auto vecPreProcStrategy = getVectorPreProcStrategy(genericOp);

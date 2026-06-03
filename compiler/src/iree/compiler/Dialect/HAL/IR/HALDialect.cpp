@@ -7,6 +7,7 @@
 #include "iree/compiler/Dialect/HAL/IR/HALDialect.h"
 
 #include "iree/compiler/Dialect/Encoding/IR/EncodingTypes.h"
+#include "iree/compiler/Dialect/FlexiNPU/IR/FlexiNPUDialect.h"
 #include "iree/compiler/Dialect/HAL/Analysis/DeviceAnalysis.h"
 #include "iree/compiler/Dialect/HAL/Conversion/HALToVM/Patterns.h"
 #include "iree/compiler/Dialect/HAL/IR/HALTypes.h"
@@ -180,6 +181,7 @@ HALDialect::HALDialect(MLIRContext *context)
     : Dialect(getDialectNamespace(), context, TypeID::get<HALDialect>()) {
   context->loadDialect<mlir::cf::ControlFlowDialect>();
   context->loadDialect<mlir::scf::SCFDialect>();
+  context->loadDialect<flexinpu::FlexiNPUDialect>();
   context->loadDialect<IREE::Util::UtilDialect>();
 
   registerAttributes();

@@ -82,6 +82,7 @@ iree_cc_library(
   DEPS
     ::PassHeaders
     ::PassesIncGen
+    iree::compiler::Codegen::LLVMCPU::RoCC::RoCCPasses
     IREELinalgTransformDialect
     LLVMBinaryFormat
     LLVMSupport
@@ -167,6 +168,7 @@ iree_cc_library(
     iree::compiler::Codegen::Utils::CodegenOptions
     iree::compiler::Dialect::HAL::IR
     iree::compiler::Dialect::HAL::IR::HALDialect
+    iree::compiler::Dialect::FlexiNPU::IR
     iree::compiler::Dialect::LinalgExt::IR
     iree::compiler::Dialect::LinalgExt::Transforms
     iree::compiler::Dialect::LinalgExt::Utils

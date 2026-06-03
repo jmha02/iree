@@ -1,0 +1,20 @@
+iree_cc_library(
+  NAME
+    Utils
+  HDRS
+    "FuncUtils.h"
+    "ParamUtils.h"
+    "Utils.h"
+  SRCS
+    "Utils.cpp"
+  DEPS
+    LLVMSupport
+    MLIRArithDialect
+    MLIRFuncDialect
+    MLIRIR
+    MLIRLinalgDialect
+    MLIRMemRefDialect
+    MLIRSCFDialect
+    iree::compiler::Dialect::FlexiNPU::IR
+  PUBLIC
+)

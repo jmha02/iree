@@ -80,6 +80,7 @@ iree_cc_library(
     MLIRSCFDialect
     MLIRTransformUtils
     iree::compiler::Dialect::Encoding::IR
+    iree::compiler::Dialect::FlexiNPU::IR
     iree::compiler::Dialect::HAL::Analysis
     iree::compiler::Dialect::HAL::Conversion::HALToVM
     iree::compiler::Dialect::HAL::hal_imports

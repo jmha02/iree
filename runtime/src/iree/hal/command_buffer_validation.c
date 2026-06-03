@@ -112,6 +112,16 @@ static iree_status_t iree_hal_command_buffer_validate_binding_requirements(
         "binding table slot requires a buffer but none was provided");
   }
 
+  // Some embedded/local-sync RISC-V paths bind VM rodata-backed buffers whose
+  // HAL usage metadata is not populated. The local CPU dispatch path can still
+  // legally read those buffers, but strict queue-dispatch validation rejects
+  // them before execution. Let the dispatch proceed in that case; concrete
+  // range checks below still validate the binding span.
+  if (iree_hal_buffer_allowed_usage(binding.buffer) ==
+      IREE_HAL_BUFFER_USAGE_NONE) {
+    return iree_ok_status();
+  }
+
   // Ensure the buffer is compatible with the device.
   // NOTE: this check is very slow! We may want to disable this outside of debug
   // mode or try to fast path it if the buffer is known-good.

@@ -11,6 +11,7 @@
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenAttrs.h"
 #include "iree/compiler/Codegen/Dialect/Codegen/IR/IREECodegenInterfaces.h"
 #include "iree/compiler/Codegen/LLVMCPU/Passes.h"
+#include "iree/compiler/Codegen/LLVMCPU/RoCC/Passes.h"
 #include "iree/compiler/Codegen/Utils/CodegenOptions.h"
 #include "iree/compiler/Dialect/LinalgExt/Transforms/Passes.h"
 #include "iree/compiler/Dialect/Util/Transforms/Passes.h"
@@ -783,6 +784,7 @@ void registerCodegenLLVMCPUPasses() {
 
   // Generated.
   registerPasses();
+  registerCodegenLLVMCPURoCCPasses();
 
   struct LLVMCPUConfigurationPipelineOptions final
       : PassPipelineOptions<LLVMCPUConfigurationPipelineOptions> {

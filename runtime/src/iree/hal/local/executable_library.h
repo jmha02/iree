@@ -377,7 +377,7 @@ typedef int (*iree_hal_executable_dispatch_v0_t)(
 // Maximum number of constants that can be used by a single dispatch.
 #define IREE_HAL_EXECUTABLE_MAX_CONSTANT_COUNT 64
 // Maximum number of bindings that can be used by a single dispatch.
-#define IREE_HAL_EXECUTABLE_MAX_BINDING_COUNT 64
+#define IREE_HAL_EXECUTABLE_MAX_BINDING_COUNT 255
 
 // Flags defining dispatch behavior.
 enum iree_hal_executable_dispatch_flag_v0_bits_e {
