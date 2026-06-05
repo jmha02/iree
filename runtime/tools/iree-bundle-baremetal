@@ -1,0 +1,1016 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import shlex
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import List, Optional, Sequence, Tuple
+
+
+TYPE_TABLE = {
+    "bf16": ("IREE_HAL_ELEMENT_TYPE_BFLOAT_16", 2),
+    "f32": ("IREE_HAL_ELEMENT_TYPE_FLOAT_32", 4),
+    "f16": ("IREE_HAL_ELEMENT_TYPE_FLOAT_16", 2),
+    "i64": ("IREE_HAL_ELEMENT_TYPE_SINT_64", 8),
+    "i32": ("IREE_HAL_ELEMENT_TYPE_SINT_32", 4),
+    "i16": ("IREE_HAL_ELEMENT_TYPE_SINT_16", 2),
+    "i8": ("IREE_HAL_ELEMENT_TYPE_SINT_8", 1),
+    "u64": ("IREE_HAL_ELEMENT_TYPE_UINT_64", 8),
+    "u32": ("IREE_HAL_ELEMENT_TYPE_UINT_32", 4),
+    "u16": ("IREE_HAL_ELEMENT_TYPE_UINT_16", 2),
+    "u8": ("IREE_HAL_ELEMENT_TYPE_UINT_8", 1),
+}
+
+TYPE_ALIASES = {
+    "si64": "i64",
+    "si32": "i32",
+    "si16": "i16",
+    "si8": "i8",
+    "ui64": "u64",
+    "ui32": "u32",
+    "ui16": "u16",
+    "ui8": "u8",
+}
+
+DEFAULT_LITERAL_ELEMENT = "i32"
+PRIMITIVE_KIND_MAP = {
+    "i": ("IREE_BAREMETAL_INPUT_KIND_I32", "i32", "(int32_t){}"),
+    "I": ("IREE_BAREMETAL_INPUT_KIND_I64", "i64", "(int64_t){}"),
+    "f": ("IREE_BAREMETAL_INPUT_KIND_F32", "f32", "{}f"),
+    "F": ("IREE_BAREMETAL_INPUT_KIND_F64", "f64", "{}"),
+}
+
+
+def parse_shape_and_type(
+    shape_part: str,
+    *,
+    allow_default_scalar: bool = False,
+    force_unit_shape: bool = False,
+) -> Tuple[List[int], str, str, int]:
+    dims_tokens = shape_part.split("x") if shape_part else []
+    if not dims_tokens:
+        if not allow_default_scalar:
+            raise ValueError(f"Missing shape/type in '{shape_part}'")
+        element_token = DEFAULT_LITERAL_ELEMENT
+        dims: List[int] = []
+    else:
+        element_token = dims_tokens[-1]
+        dims = [int(token) for token in dims_tokens[:-1] if token]
+    element_token = TYPE_ALIASES.get(element_token, element_token)
+    if element_token not in TYPE_TABLE:
+        raise ValueError(f"Unsupported element type '{element_token}'")
+    element_const, element_size = TYPE_TABLE[element_token]
+    if force_unit_shape and not dims:
+        dims = [1]
+    return dims, element_token, element_const, element_size
+
+
+def float_to_bf16_bytes(value: float) -> bytes:
+    bits = struct.unpack("<I", struct.pack("<f", value))[0]
+    rounding_bias = ((bits >> 16) & 1) + 0x7FFF
+    bf16 = (bits + rounding_bias) >> 16
+    return bf16.to_bytes(2, "little")
+
+
+def serialize_scalar_literal(value: str, element_token: str) -> bytes:
+    value = value.strip()
+    if not value:
+        raise ValueError("Literal input is empty.")
+    if element_token in {"i64", "i32", "i16", "i8", "u64", "u32", "u16", "u8"}:
+        signed = element_token.startswith("i")
+        bits = TYPE_TABLE[element_token][1] * 8
+        parsed = int(value, 0)
+        if signed:
+            min_val = -(1 << (bits - 1))
+            max_val = (1 << (bits - 1)) - 1
+        else:
+            min_val = 0
+            max_val = (1 << bits) - 1
+        if not (min_val <= parsed <= max_val):
+            raise ValueError(
+                f"Value {parsed} does not fit in {element_token} (range {min_val}..{max_val})."
+            )
+        return parsed.to_bytes(TYPE_TABLE[element_token][1], byteorder="little", signed=signed)
+    if element_token == "f32":
+        return struct.pack("<f", float(value))
+    if element_token == "f16":
+        return struct.pack("<e", float(value))
+    if element_token == "bf16":
+        return float_to_bf16_bytes(float(value))
+    raise ValueError(f"Literal inputs not supported for element type '{element_token}'.")
+
+
+TOOL_DIR = Path(__file__).resolve().parent
+BAREMETAL_DIR = TOOL_DIR / "baremetal"
+DENSE_ENCODING = "IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR"
+SCRIPT_DIR = Path(os.getenv("IREE_RT_DIR", str(BAREMETAL_DIR))) / "src"
+SUPPORT_DIR = Path(os.getenv("IREE_RT_DIR", str(BAREMETAL_DIR))) / "support"
+
+FALLBACK_TOOLS = (
+    "clang",
+    "riscv64-unknown-elf-clang",
+    "riscv64-unknown-elf-gcc",
+)
+FALLBACK_TOOLS_CXX = (
+    "clang++",
+    "riscv64-unknown-elf-clang++",
+    "riscv64-unknown-elf-g++",
+)
+OBJ_COPY_CANDIDATES = (
+    "llvm-objcopy",
+    "riscv64-unknown-elf-objcopy",
+)
+STRIP_CANDIDATES = (
+    "llvm-strip",
+    "riscv64-unknown-elf-strip",
+)
+
+
+def parse_primitive_literal(spec: str, type_code: str) -> float:
+    expected_labels = {
+        "i": "i32",
+        "I": "i64",
+        "f": "f32",
+        "F": "f64",
+    }
+    token = spec.strip()
+    if not token:
+        raise ValueError("Primitive input is empty.")
+    if "=" in token:
+        prefix, literal = token.split("=", 1)
+        prefix = prefix.strip()
+        literal = literal.strip()
+        if prefix and prefix != expected_labels[type_code]:
+            raise ValueError(
+                f"Primitive input '{spec}' has mismatched type label '{prefix}'. "
+                f"Expected '{expected_labels[type_code]}'."
+            )
+        token = literal
+    if not token:
+        raise ValueError("Primitive literal is empty.")
+    if type_code in {"i", "I"}:
+        value = int(token, 0)
+        if type_code == "i":
+            min_val = -(1 << 31)
+            max_val = (1 << 31) - 1
+        else:
+            min_val = -(1 << 63)
+            max_val = (1 << 63) - 1
+        if not (min_val <= value <= max_val):
+            raise ValueError(
+                f"Value {value} out of range for "
+                f"{expected_labels[type_code]} ({min_val}..{max_val})."
+            )
+        return value
+    value = float(token)
+    return value
+
+
+def format_primitive_literal(value: float, type_code: str) -> str:
+    if type_code == "f":
+        coerced = struct.unpack("<f", struct.pack("<f", float(value)))[0]
+        literal = repr(coerced)
+        if "e" not in literal and "E" not in literal and "." not in literal:
+            literal = literal + ".0"
+        return PRIMITIVE_KIND_MAP[type_code][2].format(literal)
+    if type_code == "F":
+        literal = "{:0.17g}".format(float(value))
+        if "e" not in literal and "E" not in literal and "." not in literal:
+            literal = literal + ".0"
+        return PRIMITIVE_KIND_MAP[type_code][2].format(literal)
+    formatter = PRIMITIVE_KIND_MAP[type_code][2]
+    return formatter.format(value)
+
+
+def read_function_cconv(module_path: Path, function_name: str) -> Optional[str]:
+    dump_tool = shutil.which("iree-dump-module")
+    if dump_tool is None:
+        return None
+    try:
+        output = run(
+            [dump_tool, "--output=flatbuffer-json", str(module_path)],
+            capture_output=True,
+        )
+    except subprocess.CalledProcessError:
+        return None
+    try:
+        data = json.loads(output)
+    except json.JSONDecodeError:
+        return None
+    exports = data.get("exported_functions", [])
+    signatures = data.get("function_signatures", [])
+    for idx, export in enumerate(exports):
+        if export.get("local_name") == function_name:
+            ordinal = export.get("internal_ordinal")
+            if isinstance(ordinal, int) and 0 <= ordinal < len(signatures):
+                return signatures[ordinal].get("calling_convention")
+            if idx < len(signatures):
+                return signatures[idx].get("calling_convention")
+            break
+    return None
+
+
+def parse_cconv_inputs(cconv: Optional[str]) -> List[str]:
+    if not cconv:
+        return []
+    if "_" in cconv:
+        head, _ = cconv.split("_", 1)
+    else:
+        head = cconv
+    head = head.lstrip("0123456789")
+    inputs: List[str] = []
+    for char in head:
+        if char in {"C", "D"}:
+            raise ValueError(
+                "Span-based inputs in calling convention are not supported."
+            )
+        inputs.append(char)
+    return inputs
+
+
+def infer_input_type_from_spec(spec: str) -> str:
+    parts = spec.strip().split("=", 1)
+    token = parts[0].strip()
+    if len(parts) == 2 and parts[1].strip().startswith("@"):
+        return "r"
+    primitive_labels = {"i32": "i", "i64": "I", "f32": "f", "f64": "F"}
+    if token in primitive_labels:
+        return primitive_labels[token]
+    return "r"
+
+
+def run(
+    cmd: Sequence[str],
+    *,
+    capture_output: bool = False,
+    cwd: Optional[Path] = None,
+) -> str:
+    print(" ".join(cmd))
+    print()
+    result = subprocess.run(
+        cmd,
+        check=True,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE if capture_output else None,
+        stderr=subprocess.PIPE if capture_output else None,
+        text=True,
+    )
+    if capture_output:
+        return result.stdout
+    return ""
+
+
+def parse_tensor_spec(
+    spec: str, *, require_data: bool
+) -> Tuple[List[int], str, str, int, Optional[Path], Optional[str]]:
+    spec = spec.strip()
+    literal_value: Optional[str] = None
+    file_path: Optional[Path] = None
+    force_unit_shape = False
+    if require_data:
+        shape_part = spec
+        if "=" in spec:
+            shape_candidate, rhs = spec.split("=", 1)
+            rhs = rhs.strip()
+            shape_part = shape_candidate.strip()
+            if rhs.startswith("@"):
+                file_path = Path(rhs[1:]).expanduser().resolve()
+            else:
+                literal_value = rhs
+        else:
+            shape_part = ""
+            literal_value = spec
+        if not file_path and literal_value is None:
+            raise ValueError(
+                f"Input spec '{spec}' must provide a @file path or literal value."
+            )
+        normalized_shape = shape_part.strip()
+        has_explicit_shape = bool(normalized_shape) and "x" in normalized_shape
+        force_unit_shape = literal_value is not None and not has_explicit_shape
+        allow_default_scalar = literal_value is not None and not shape_part
+    else:
+        if "=" in spec:
+            raise ValueError(
+                f"Unexpected '=' in output spec '{spec}'. "
+                "Outputs should be provided as shapextype only."
+            )
+        shape_part = spec
+        allow_default_scalar = False
+    dims, element_token, element_const, element_size = parse_shape_and_type(
+        shape_part,
+        allow_default_scalar=allow_default_scalar,
+        force_unit_shape=force_unit_shape,
+    )
+    return dims, element_token, element_const, element_size, file_path, literal_value
+
+
+def extract_symbols(obj: Path, toolchain_root: Path) -> Tuple[str, str]:
+    nm = toolchain_root / "bin" / "llvm-nm"
+    output = run([str(nm), "--defined-only", str(obj)], capture_output=True)
+    start_sym = None
+    end_sym = None
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        symbol = parts[-1]
+        if symbol.endswith("_start"):
+            start_sym = symbol
+        elif symbol.endswith("_end"):
+            end_sym = symbol
+    if not start_sym or not end_sym:
+        raise RuntimeError(f"unable to find binary symbols in {obj}")
+    return start_sym, end_sym
+
+
+def make_include_args(include_dirs: Sequence[Path]) -> List[str]:
+    args: List[str] = []
+    for include_dir in include_dirs:
+        args.extend(["-I", str(include_dir)])
+    return args
+
+
+def gather_link_objects(runtime_root: Path) -> List[str]:
+    lib_paths = set()
+    for pattern in (
+        "runtime/src/iree/**/*.a",
+        "build_tools/third_party/flatcc/*.a",
+    ):
+        for path in runtime_root.glob(pattern):
+            if path.is_file():
+                lib_paths.add(path.resolve())
+    if not lib_paths:
+        raise RuntimeError(
+            "failed to locate runtime static libraries under "
+            f"{runtime_root}"
+        )
+    return sorted(str(path) for path in lib_paths)
+
+
+def derive_compile_args(base: List[str], src: Path, out: Path) -> List[str]:
+    args = list(base)
+    try:
+        idx = args.index("-o")
+        args[idx + 1] = str(out)
+    except ValueError:
+        args.extend(["-o", str(out)])
+    try:
+        c_idx = args.index("-c")
+        args[c_idx + 1] = str(src)
+    except ValueError:
+        args.extend(["-c", str(src)])
+    return args
+
+
+def filter_compile_command(cmd: Sequence[str]) -> List[str]:
+    args = []
+    skip_next = False
+    for token in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if token in ("-MD", "-MMD"):
+            continue
+        if token in ("-MT", "-MF"):
+            skip_next = True
+            continue
+        args.append(token)
+    return args
+
+
+def load_compile_command(runtime_root: Path) -> List[str]:
+    output = run(
+        [
+            "ninja",
+            "-C",
+            str(runtime_root),
+            "-t",
+            "commands",
+            "runtime/src/iree/base/libiree_base_base.a",
+        ],
+        capture_output=True,
+    )
+    lines = [
+        line
+        for line in output.splitlines()
+        if line.strip() and not line.startswith("Total output lines")
+    ]
+    if not lines:
+        raise RuntimeError("unable to derive compile command from runtime build")
+    command_line = lines[0].strip()
+    if "&&" in command_line:
+        command_line = command_line.split("&&")[-1].strip()
+    if command_line.startswith(":"):
+        command_line = command_line[1:].strip()
+    return filter_compile_command(shlex.split(command_line))
+
+
+def resolve_tool(toolchain_root: Path, candidates: Sequence[str]) -> Path:
+    for name in candidates:
+        tool = toolchain_root / "bin" / name
+        if tool.exists():
+            return tool
+    raise FileNotFoundError(
+        f"none of {', '.join(candidates)} found under {toolchain_root / 'bin'}"
+    )
+
+
+def resolve_compilers(toolchain_root: Path) -> Tuple[Path, Path]:
+    cc = resolve_tool(toolchain_root, FALLBACK_TOOLS)
+    cxx = resolve_tool(toolchain_root, FALLBACK_TOOLS_CXX)
+    return cc, cxx
+
+
+def prepare_payload(
+    path: Path,
+    toolchain_root: Path,
+    temp_dir: Path,
+    prefix: str,
+) -> Tuple[Path, str, str]:
+    objcopy = None
+    for candidate in OBJ_COPY_CANDIDATES:
+        tool = toolchain_root / "bin" / candidate
+        if tool.exists():
+            objcopy = tool
+            break
+    if objcopy is None:
+        raise FileNotFoundError(
+            f"unable to find objcopy in {toolchain_root / 'bin'}"
+        )
+    out_obj = temp_dir / f"{prefix}.o"
+    run(
+        [
+            str(objcopy),
+            "-I",
+            "binary",
+            "-O",
+            "elf64-littleriscv",
+            "-B",
+            "riscv:rv64",
+            "--set-section-alignment",
+            ".data=16",
+            "--rename-section",
+            ".data=.rodata",
+            str(path),
+            str(out_obj),
+        ]
+    )
+    start_sym, end_sym = extract_symbols(out_obj, toolchain_root)
+    return out_obj, start_sym, end_sym
+
+
+def strip_binary(path: Path, toolchain_root: Path) -> None:
+    try:
+        strip_tool = resolve_tool(toolchain_root, STRIP_CANDIDATES)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            "requested to strip output, but no strip tool found under "
+            f"{toolchain_root / 'bin'}"
+        ) from exc
+    run([str(strip_tool), "--strip-unneeded", str(path)])
+
+
+def generate_spec(
+    module_obj,
+    module_syms,
+    inputs,
+    outputs,
+    entry,
+    temp_dir,
+    *,
+    print_outputs: bool,
+    print_limit: int,
+    runner: str,
+) -> Path:
+    tooling_entry = entry
+    if "." not in entry:
+        entry = f"module.{entry}"
+    entry_literal = entry.replace("\\", "\\\\").replace('"', '\\"')
+    spec_path = temp_dir / "bundle_spec.c"
+    render_inputs = []
+    for idx, inp in enumerate(inputs):
+        dims = ", ".join(str(d) for d in inp.get("shape", []))
+        render_inputs.append(
+            {
+                "index": idx,
+                "kind": inp["kind"],
+                "is_tensor": inp.get("is_tensor", False),
+                "start": inp.get("start"),
+                "end": inp.get("end"),
+                "element": inp.get("element"),
+                "has_shape": bool(inp.get("shape")),
+                "shape_rank": len(inp.get("shape", [])),
+                "shape_dims": f'kInput{idx}Shape' if inp.get("shape") else "NULL",
+                "dims": dims,
+                "value_field": inp.get("value_field"),
+                "value_literal": inp.get("value_literal"),
+            }
+        )
+    render_outputs = []
+    for idx, out in enumerate(outputs):
+        dims = ", ".join(str(d) for d in out["shape"])
+        element_count = out["element_count"] or 1
+        size = out["element_size"] * max(element_count, 1)
+        render_outputs.append(
+            {
+                "index": idx,
+                "element": out["element"],
+                "element_size": out["element_size"],
+                "element_label": out["element_label"],
+                "has_shape": bool(out["shape"]),
+                "shape_rank": len(out["shape"]),
+                "shape_dims": f'kOutput{idx}Shape' if out["shape"] else "NULL",
+                "dims": dims,
+                "element_count": element_count,
+                "buffer_size": size,
+            }
+        )
+
+    lines = [
+        "#include <stdbool.h>",
+        "#include <stddef.h>",
+        '#include "bundle_spec.h"',
+        "",
+        f"extern const uint8_t {module_syms[0]}[];",
+        f"extern const uint8_t {module_syms[1]}[];",
+    ]
+    for inp in render_inputs:
+        if inp["is_tensor"]:
+            lines.append(f"extern const uint8_t {inp['start']}[];")
+            lines.append(f"extern const uint8_t {inp['end']}[];")
+    lines.append("")
+    for inp in render_inputs:
+        if inp["has_shape"]:
+            lines.append(f"static const iree_hal_dim_t kInput{inp['index']}Shape[] = {{ {inp['dims']} }};")
+    for out in render_outputs:
+        if out["has_shape"]:
+            lines.append(f"static const iree_hal_dim_t kOutput{out['index']}Shape[] = {{ {out['dims']} }};")
+    for out in render_outputs:
+        lines.append(f"static uint8_t gOutput{out['index']}Buffer[{out['buffer_size']}] = {{0}};")
+        lines.append(f"static const char kOutput{out['index']}TypeLabel[] = \"{out['element_label']}\";")
+    lines.append("")
+    if runner == "tooling":
+        lines.extend([
+            "typedef struct iree_baremetal_vfs_file_t {",
+            "  const char* path;",
+            "  const uint8_t* data;",
+            "  size_t size;",
+            "} iree_baremetal_vfs_file_t;",
+            "",
+        ])
+        virtual_inputs = [inp for inp in render_inputs if inp["is_tensor"]]
+        if virtual_inputs:
+            lines.append("static iree_baremetal_vfs_file_t kVirtualFiles[] = {")
+            for inp in virtual_inputs:
+                lines.append("  {")
+                lines.append(f"    .path = \"/iree/input{inp['index']}.bin\",")
+                lines.append(f"    .data = {inp['start']},")
+                lines.append("    .size = 0,")
+                lines.append("  },")
+            lines.append("};")
+        else:
+            lines.append("static const iree_baremetal_vfs_file_t* kVirtualFiles = NULL;")
+        lines.extend([
+            "",
+            "const iree_baremetal_vfs_file_t* iree_baremetal_vfs_files(size_t* out_count) {",
+            f"  if (out_count) *out_count = {'IREE_ARRAYSIZE(kVirtualFiles)' if virtual_inputs else '0'};",
+            "  return kVirtualFiles;",
+            "}",
+            "",
+        ])
+        argv = ["baremetal-static-run-module", f"--function={tooling_entry}"]
+        argv.append(f"--output_max_element_count={max(print_limit, 0)}")
+        for inp in inputs:
+            if inp.get("is_tensor"):
+                argv.append(f"--input={inp['tooling_spec']}")
+            else:
+                argv.append(f"--input={inp['tooling_spec']}")
+        if outputs:
+            for _ in outputs:
+                argv.append("--output=-")
+        argv_literal_names = []
+        for idx, arg in enumerate(argv):
+            arg_literal = arg.replace("\\", "\\\\").replace('"', '\\"')
+            name = f"kArgv{idx}"
+            argv_literal_names.append(name)
+            lines.append(f"static char {name}[] = \"{arg_literal}\";")
+        lines.append("static char* kToolingArgv[] = {")
+        for name in argv_literal_names:
+            lines.append(f"  {name},")
+        lines.append("};")
+        lines.append("")
+    if render_inputs:
+        lines.append("static iree_baremetal_input_t kInputs[] = {")
+        for inp in render_inputs:
+            lines.append("  {")
+            lines.append(f"    .kind = {inp['kind']},")
+            lines.append("    .value = {")
+            if inp["is_tensor"]:
+                lines.append("      .tensor = {")
+                lines.append(f"        .element_type = {inp['element']},")
+                lines.append(f"        .encoding_type = {DENSE_ENCODING},")
+                lines.append(f"        .shape_rank = {inp['shape_rank']},")
+                lines.append(f"        .shape_dims = {inp['shape_dims']},")
+                lines.append("        .buffer = {0},")
+                lines.append("      },")
+            else:
+                lines.append(f"      .{inp['value_field']} = {inp['value_literal']},")
+            lines.append("    },")
+            lines.append("  },")
+        lines.append("};")
+    if render_outputs:
+        lines.append("static iree_baremetal_output_t kOutputs[] = {")
+        for out in render_outputs:
+            lines.append("  {")
+            lines.append(f"    .element_type = {out['element']},")
+            lines.append(f"    .encoding_type = {DENSE_ENCODING},")
+            lines.append(f"    .shape_rank = {out['shape_rank']},")
+            lines.append(f"    .shape_dims = {out['shape_dims']},")
+            lines.append(f"    .element_count = (iree_host_size_t){out['element_count']},")
+            lines.append(f"    .element_size = (iree_host_size_t){out['element_size']},")
+            lines.append(f"    .element_type_label = kOutput{out['index']}TypeLabel,")
+            lines.append("    .result_buffer = {")
+            lines.append(f"      .data = gOutput{out['index']}Buffer,")
+            lines.append(f"      .data_length = (iree_host_size_t)sizeof(gOutput{out['index']}Buffer),")
+            lines.append("    },")
+            lines.append("  },")
+        lines.append("};")
+    lines.extend([
+        "",
+        "static iree_baremetal_bundle_spec_t gBundle = {",
+        "  .entry_function = {0},",
+        "  .module_data = {0},",
+        f"  .input_count = {'IREE_ARRAYSIZE(kInputs)' if render_inputs else '0'},",
+        f"  .inputs = {'kInputs' if render_inputs else 'NULL'},",
+        f"  .output_count = {'IREE_ARRAYSIZE(kOutputs)' if render_outputs else '0'},",
+        f"  .outputs = {'kOutputs' if render_outputs else 'NULL'},",
+        f"  .print_outputs = {'true' if print_outputs else 'false'},",
+        f"  .print_limit = (iree_host_size_t){max(print_limit, 0)},",
+        f"  .tooling_argc = {'IREE_ARRAYSIZE(kToolingArgv)' if runner == 'tooling' else '0'},",
+        f"  .tooling_argv = {'kToolingArgv' if runner == 'tooling' else 'NULL'},",
+        "};",
+        "",
+        "static void iree_baremetal_initialize(void) {",
+        "  static bool initialized = false;",
+        "  if (initialized) return;",
+        f"  gBundle.entry_function = iree_make_cstring_view(\"{entry_literal}\");",
+        f"  gBundle.module_data.data = {module_syms[0]};",
+        f"  gBundle.module_data.data_length = (iree_host_size_t)({module_syms[1]} - {module_syms[0]});",
+    ])
+    virtual_file_index = 0
+    for inp in render_inputs:
+        if inp["is_tensor"]:
+            idx = inp["index"]
+            lines.append(f"  kInputs[{idx}].value.tensor.buffer.data = {inp['start']};")
+            lines.append(f"  kInputs[{idx}].value.tensor.buffer.data_length = (iree_host_size_t)({inp['end']} - {inp['start']});")
+            if runner == "tooling":
+                lines.append(f"  kVirtualFiles[{virtual_file_index}].size = (size_t)({inp['end']} - {inp['start']});")
+                virtual_file_index += 1
+    lines.extend([
+        "  initialized = true;",
+        "}",
+        "",
+        "const iree_baremetal_bundle_spec_t* iree_baremetal_acquire_spec(void) {",
+        "  iree_baremetal_initialize();",
+        "  return &gBundle;",
+        "}",
+        "",
+    ])
+    rendered = "\n".join(lines)
+    spec_path.write_text(rendered)
+    return spec_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Bundle IREE artifacts into a bare-metal RISC-V ELF.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--module", required=True, help="VMFB module path.")
+    parser.add_argument("--function", required=True, help="Entry function name.")
+    parser.add_argument(
+        "--input",
+        action="append",
+        default=[],
+        help=(
+            "Input spec. Tensor arguments use shape/type=@file and scalars "
+            "use plain literals (the VM function signature determines the type)."
+        ),
+    )
+    parser.add_argument(
+        "--output-spec",
+        action="append",
+        default=[],
+        help="Optional output tensor spec for capturing results.",
+    )
+    parser.add_argument("--output", required=True, help="Output ELF path.")
+    parser.add_argument(
+        "--output-print-limit",
+        type=int,
+        default=16,
+        help=(
+            "Maximum number of elements per output tensor to print. "
+            "Use 0 to print all available elements."
+        ),
+    )
+    parser.add_argument(
+        "--runtime-root",
+        default=os.environ.get("IREE_RT_BAREMETAL_DIR"),
+        help="Path to IREE runtime build directory (bare-metal toolchain).",
+    )
+    parser.add_argument(
+        "--toolchain-root",
+        default=os.environ.get("RISCV"),
+        help="RISCV toolchain root (expects riscv64-unknown-elf binaries).",
+    )
+    parser.add_argument(
+        "--march",
+        default="rv64gc",
+        help="Target ISA for compilation.",
+    )
+    parser.add_argument(
+        "--mabi",
+        default="lp64d",
+        help="Target ABI for compilation.",
+    )
+    parser.add_argument(
+        "--optimize-size",
+        action="store_true",
+        help="Favor binary size over performance (enables section GC and -Os).",
+    )
+    parser.add_argument(
+        "--strip",
+        action="store_true",
+        help="Strip unneeded symbols from the resulting ELF.",
+    )
+    parser.add_argument(
+        "--runner",
+        choices=["direct", "tooling"],
+        default="direct",
+        help=(
+            "Baremetal runner implementation. 'direct' calls IREE VM APIs "
+            "with embedded inputs. 'tooling' uses IREE run_module tooling with "
+            "embedded inputs exposed through a tiny virtual file system."
+        ),
+    )
+    args = parser.parse_args()
+
+    if args.runtime_root is None:
+        raise ValueError("--runtime-root must be set, or $IREE_RT_BAREMETAL_DIR is defined")
+    if args.toolchain_root is None:
+        raise ValueError("--toolchain-root must be set, or $RISCV is defined (defined from CHIPYARD)")
+
+    runtime_root = Path(args.runtime_root).resolve()
+    toolchain_root = Path(args.toolchain_root).resolve()
+    module_path = Path(args.module).expanduser().resolve()
+    output_path = Path(args.output).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    function_cconv = read_function_cconv(module_path, args.function)
+    try:
+        expected_input_types = parse_cconv_inputs(function_cconv)
+    except ValueError as exc:
+        raise RuntimeError(f"Failed to parse calling convention for {args.function}: {exc}") from exc
+    if not expected_input_types:
+        expected_input_types = [infer_input_type_from_spec(spec) for spec in args.input]
+    elif len(args.input) != len(expected_input_types):
+        raise ValueError(
+            f"Function '{args.function}' expects {len(expected_input_types)} inputs "
+            f"but {len(args.input)} --input flags were provided."
+        )
+
+    compile_base = load_compile_command(runtime_root)
+    if not compile_base:
+        raise RuntimeError("failed to derive compile command from runtime build")
+    cc_path, cxx_path = resolve_compilers(toolchain_root)
+    compile_base[0] = str(cc_path)
+
+    link_objs = gather_link_objects(runtime_root)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_dir = Path(tmpdir)
+        module_obj, module_start, module_end = prepare_payload(
+            module_path, toolchain_root, temp_dir, "module"
+        )
+        if args.optimize_size:
+            extra_compile_flags: List[str] = [
+                "-Os",
+            ]
+        else:
+            extra_compile_flags = [
+                "-O3",
+                "-DNDEBUG",
+            ]
+        inputs = []
+        for idx, (spec, input_type) in enumerate(zip(args.input, expected_input_types)):
+            if input_type == "r":
+                shape, token, element, element_size, path, literal_value = parse_tensor_spec(
+                    spec, require_data=True
+                )
+                if literal_value is not None:
+                    if shape and not (len(shape) == 1 and shape[0] == 1):
+                        raise ValueError(
+                            f"Literal inputs currently only support scalars. Offending spec: '{spec}'"
+                        )
+                    literal_bytes = serialize_scalar_literal(literal_value, token)
+                    literal_file = temp_dir / f"input_{idx}_literal.bin"
+                    literal_file.write_bytes(literal_bytes)
+                    path = literal_file
+                if path is None:
+                    raise ValueError(
+                        f"Input spec '{spec}' is missing data. Provide a literal or @file."
+                    )
+                shape_prefix = "x".join(str(dim) for dim in shape)
+                tooling_type = f"{shape_prefix}x{token}" if shape_prefix else token
+                obj, start, end = prepare_payload(
+                    path, toolchain_root, temp_dir, f"input_{idx}"
+                )
+                inputs.append(
+                    {
+                        "object": obj,
+                        "start": start,
+                        "end": end,
+                        "shape": shape,
+                        "element": element,
+                        "element_size": element_size,
+                        "kind": "IREE_BAREMETAL_INPUT_KIND_TENSOR",
+                        "is_tensor": True,
+                        "tooling_spec": f"{tooling_type}=@/iree/input{idx}.bin",
+                    }
+                )
+            elif input_type in PRIMITIVE_KIND_MAP:
+                parsed_value = parse_primitive_literal(spec, input_type)
+                kind_enum, value_field, _ = PRIMITIVE_KIND_MAP[input_type]
+                inputs.append(
+                    {
+                        "kind": kind_enum,
+                        "is_tensor": False,
+                        "value_field": value_field,
+                        "value_literal": format_primitive_literal(parsed_value, input_type),
+                        "tooling_spec": spec,
+                    }
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported input type '{input_type}' for spec '{spec}'. "
+                    "Only tensors and primitive scalars are supported."
+                )
+        outputs = []
+        for spec in args.output_spec:
+            shape, token, element, element_size, _, _ = parse_tensor_spec(
+                spec, require_data=False
+            )
+            element_count = 1
+            for dim in shape:
+                element_count *= dim
+            outputs.append(
+                {
+                    "shape": shape,
+                    "element": element,
+                    "element_size": element_size,
+                    "element_count": element_count,
+                    "element_label": token,
+                }
+            )
+
+        spec_path = generate_spec(
+            module_obj,
+            (module_start, module_end),
+            inputs,
+            outputs,
+            args.function,
+            temp_dir,
+            print_outputs=bool(outputs),
+            print_limit=args.output_print_limit,
+            runner=args.runner,
+        )
+
+        include_dirs = [
+            SCRIPT_DIR,
+            runtime_root / "runtime" / "src",
+            runtime_root.parent / "third_party" / "flatcc" / "include",
+        ]
+        runtime_obj = temp_dir / "runtime_entry.o"
+        runtime_source = "runtime_entry_tooling.c" if args.runner == "tooling" else "runtime_entry.c"
+        cmd_runtime = derive_compile_args(
+            compile_base, SCRIPT_DIR / runtime_source, runtime_obj
+        )
+        cmd_runtime.extend(make_include_args(include_dirs))
+        cmd_runtime.extend([
+            "-mno-relax",
+            "-msmall-data-limit=0",
+            "-fno-section-anchors",
+        ])
+        cmd_runtime.extend(extra_compile_flags)
+        run(cmd_runtime, cwd=runtime_root)
+
+        spec_obj = temp_dir / "bundle_spec.o"
+        cmd_spec = derive_compile_args(compile_base, spec_path, spec_obj)
+        cmd_spec.extend(make_include_args(include_dirs))
+        cmd_spec.extend([
+            "-mno-relax",
+            "-msmall-data-limit=0",
+            "-fno-section-anchors",
+        ])
+        cmd_spec.extend(extra_compile_flags)
+        run(cmd_spec, cwd=runtime_root)
+
+        payload_objects = [module_obj] + [
+            inp["object"] for inp in inputs if inp.get("is_tensor")
+        ]
+
+        support_objects = []
+        for source in ("crt.S", "syscalls.c"):
+            obj = temp_dir / f"{Path(source).stem}.o"
+            cmd = derive_compile_args(
+                compile_base, SUPPORT_DIR / source, obj
+            )
+            cmd.extend(["-I", str(SUPPORT_DIR)])
+            cmd = [
+                token
+                for token in cmd
+                if token not in {"-Werror", "-std=c11"}
+            ]
+            cmd.extend(
+                [
+                    "-std=gnu11",
+                    "-Wno-format",
+                    "-Wno-implicit-function-declaration",
+                    "-D_GNU_SOURCE",
+                    "-mno-relax",
+                    "-msmall-data-limit=0",
+                    "-fno-section-anchors",
+                ]
+            )
+            if source == "syscalls.c":
+                cmd.extend(["-O1"])
+            else:
+                cmd.extend(extra_compile_flags)
+
+            run(cmd, cwd=runtime_root)
+            support_objects.append(obj)
+
+        link_cmd = [str(cxx_path)]
+        if "clang" in cxx_path.name:
+            link_cmd.append("--target=riscv64-unknown-elf")
+        link_cmd.extend(
+            [
+                f"-march={args.march}",
+                f"-mabi={args.mabi}",
+                "-nostdlib",
+                "-nostartfiles",
+                "-static",
+                "-Wl,--no-relax",
+                "-Wl,-T," + str(SUPPORT_DIR / "test.ld"),
+                "-Wl,-Map=" + str(temp_dir / "link.map"),
+                "-o",
+                str(output_path),
+            ]
+        )
+        link_cmd.append("-Wl,--gc-sections")
+        link_cmd.append("-Wl,--start-group")
+
+        lib_search = [toolchain_root / "riscv64-unknown-elf" / "lib"]
+        gcc_base = toolchain_root / "lib" / "gcc" / "riscv64-unknown-elf"
+        if gcc_base.exists():
+            versions = sorted([p for p in gcc_base.iterdir() if p.is_dir()], reverse=True)
+            lib_search.extend(versions)
+        for lib_dir in lib_search:
+            if lib_dir.exists():
+                link_cmd.extend(["-L", str(lib_dir)])
+
+        link_cmd.extend(str(obj) for obj in [runtime_obj, spec_obj])
+        link_cmd.extend(str(obj) for obj in support_objects)
+        link_cmd.extend(str(obj) for obj in payload_objects)
+        link_cmd.extend(link_objs)
+        link_opt_flag = "-Os" if args.optimize_size else "-O3"
+        link_cmd.extend([link_opt_flag, "-lm", "-lc", "-lgcc", "-lc", "-Wl,--end-group"])
+
+        run(link_cmd, cwd=runtime_root)
+
+        if args.strip or args.optimize_size:
+            try:
+                strip_binary(output_path, toolchain_root)
+            except FileNotFoundError as exc:
+                sys.stderr.write(str(exc) + "\n")
+
+    print(f"[+] Bare-metal ELF written to {output_path}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as exc:
+        if exc.stderr:
+            sys.stderr.write(exc.stderr)
+        elif exc.stdout:
+            sys.stderr.write(exc.stdout)
+        sys.exit(exc.returncode)
+    except Exception as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        sys.exit(1)
