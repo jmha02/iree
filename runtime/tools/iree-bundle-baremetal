@@ -108,8 +108,11 @@ def serialize_scalar_literal(value: str, element_token: str) -> bytes:
 TOOL_DIR = Path(__file__).resolve().parent
 BAREMETAL_DIR = TOOL_DIR / "baremetal"
 DENSE_ENCODING = "IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR"
-SCRIPT_DIR = Path(os.getenv("IREE_RT_DIR", str(BAREMETAL_DIR))) / "src"
-SUPPORT_DIR = Path(os.getenv("IREE_RT_DIR", str(BAREMETAL_DIR))) / "support"
+BAREMETAL_RUNTIME_DIR = Path(
+    os.getenv("IREE_BUNDLE_BAREMETAL_RT_DIR", str(BAREMETAL_DIR))
+)
+SCRIPT_DIR = BAREMETAL_RUNTIME_DIR / "src"
+SUPPORT_DIR = BAREMETAL_RUNTIME_DIR / "support"
 
 FALLBACK_TOOLS = (
     "clang",

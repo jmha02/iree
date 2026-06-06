@@ -166,6 +166,8 @@ void LLVMCPULowerExecutableTargetPass::runOnOperation() {
   pipelineOpts.enableAArch64I8mm =
       isAArch64(targetConfig) && hasI8mmFeature(targetConfig);
   pipelineOpts.enablePeeling = isOptEnabled(funcOp, getEnableLoopPeelingStr());
+  pipelineOpts.enableFlexiNpuTiling =
+      isRISCV(targetConfig) && hasFlexiNPUFeature(targetConfig);
 
   LoweringConfigAttrInterface loweringConfig = getRootLoweringConfig(funcOp);
   OpPassManager passManager(func::FuncOp::getOperationName());

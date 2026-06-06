@@ -98,6 +98,21 @@ addTileAndDistributePasses(OpPassManager &funcPassManager,
   funcPassManager.addPass(createPropagateDispatchSizeBoundsPass());
 }
 
+static void addFlexiNPUTensorizationPasses(
+    OpPassManager &funcPassManager, const LLVMCPUPipelineOptions &pipelineOpt) {
+  if (!pipelineOpt.enableFlexiNpuTiling) {
+    return;
+  }
+  addCPUBufferizePasses(funcPassManager);
+  funcPassManager.addPass(createEraseHALDescriptorTypeFromMemRefPass());
+  funcPassManager.addPass(createIREEExpandStridedMetadataPass());
+  funcPassManager.addPass(createFlexiNPUTensorizePass());
+  funcPassManager.addPass(createIREEExpandStridedMetadataPass());
+  funcPassManager.addPass(createFlexiNPUConvertToFunctionCallPass());
+  funcPassManager.addPass(createCanonicalizerPass());
+  funcPassManager.addPass(createCSEPass());
+}
+
 //===---------------------------------------------------------------------===//
 // Codegen pipelines.
 //===---------------------------------------------------------------------===//
@@ -154,6 +169,7 @@ void addCPUBufferOpsTileAndVectorizePipeline(
   funcPassManager.addPass(createLLVMCPUTilePass(
       IREE::CPU::TilingLevel::VectorCommonParallelTiles, /*skipRootOp=*/false));
   funcPassManager.addPass(createLLVMCPUPeelPass());
+  addFlexiNPUTensorizationPasses(funcPassManager, pipelineOpt);
   {
     GenericVectorizationPassOptions options;
     options.useConfiguredVectorSizes = pipelineOpt.useConfiguredVectorSizes;
@@ -249,6 +265,7 @@ void addMultiTilingExpertPassPipeline(
       funcPassManager.addPass(createCSEPass());
     }
     funcPassManager.addPass(createLLVMCPUTileToVectorSizePass());
+    addFlexiNPUTensorizationPasses(funcPassManager, pipelineOpt);
 
     GenericVectorizationPassOptions options;
     options.useConfiguredVectorSizes = pipelineOpt.useConfiguredVectorSizes;
@@ -304,6 +321,7 @@ void addConvTileAndDecomposeExpertPassPipeline(
 
   {
     funcPassManager.addPass(createTensorToVectorVectorizePadPass());
+    addFlexiNPUTensorizationPasses(funcPassManager, pipelineOpt);
     GenericVectorizationPassOptions options;
     options.useConfiguredVectorSizes = pipelineOpt.useConfiguredVectorSizes;
     options.enableVectorMasking = pipelineOpt.enableVectorMasking;
@@ -359,6 +377,7 @@ void addMmt4dTilingExpertPassPipeline(
       IREE::CPU::TilingLevel::VectorInnerParallelTiles));
   funcPassManager.addPass(iree_compiler::createForallToForPass());
   funcPassManager.addPass(createLLVMCPUTileToVectorSizePass());
+  addFlexiNPUTensorizationPasses(funcPassManager, pipelineOpt);
 
   {
     GenericVectorizationPassOptions options;
@@ -409,6 +428,7 @@ void addCPUDataTilingPipeline(OpPassManager &funcPassManager,
   if (pipelineOpt.decomposePackUnPackOps) {
     funcPassManager.addPass(createDecomposePackUnPackOpsPass());
   }
+  addFlexiNPUTensorizationPasses(funcPassManager, pipelineOpt);
 
   {
     GenericVectorizationPassOptions options;
@@ -448,6 +468,7 @@ void addCPULinalgExtTileAndVectorizePipeline(
       IREE::LinalgExt::createDecomposeWinogradTransformPass());
   funcPassManager.addPass(IREE::LinalgExt::createDecomposeAttentionPass());
   funcPassManager.addPass(iree_compiler::createForallToForPass());
+  addFlexiNPUTensorizationPasses(funcPassManager, pipelineOpt);
 
   {
     GenericVectorizationPassOptions options;

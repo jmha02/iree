@@ -1530,6 +1530,12 @@ getMatmulVectorSizes(mlir::FunctionOpInterface entryPointFn,
 
   // TODO: Compute vector tile sizes using heuristics.
 
+  if (targetAttr && isRISCV(targetAttr.getConfiguration()) &&
+      hasFlexiNPUFeature(targetAttr.getConfiguration())) {
+    matmulTileSizes.append({32, 32, 32});
+    matmulScalableFlags.append({false, false, false});
+  }
+
   if (targetAttr && isAArch64(targetAttr.getConfiguration())) {
     if (isScalableVectorizationEnabled() && !clDisableArmSMETiling &&
         hasSMEFeature(targetAttr.getConfiguration())) {
@@ -1546,7 +1552,8 @@ getMatmulVectorSizes(mlir::FunctionOpInterface entryPointFn,
     }
   }
 
-  if (targetAttr && isRISCV(targetAttr.getConfiguration()) &&
+  if (matmulTileSizes.empty() && targetAttr &&
+      isRISCV(targetAttr.getConfiguration()) &&
       hasAnyVFeature(targetAttr.getConfiguration())) {
     // Use default tile size for matmul_transpose_b &
     // batch_matmul_transpose_b to avoid performance drop.

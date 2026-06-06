@@ -57,18 +57,18 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
     auto C = dyn_cast<MemRefType>(vecC.getType());
 
     if (!A || !B || !C) {
-      llvm::errs() << "A or B or C is not a MemRefType\n";
-      return failure();
+      return rewriter.notifyMatchFailure(vecmatOp,
+                                         "expected memref operands");
     }
 
     if (!A.hasStaticShape() || !B.hasStaticShape() || !C.hasStaticShape()) {
-      llvm::errs() << "A or B or C is not a static shape\n";
-      return failure();
+      return rewriter.notifyMatchFailure(vecmatOp,
+                                         "expected static operand shapes");
     }
 
     if (A.getShape()[0] != B.getShape()[0] || B.getShape()[1] != C.getShape()[0]) {
-      llvm::errs() << "Illgeal shape for vecmatOp\n";
-      return failure();
+      return rewriter.notifyMatchFailure(vecmatOp,
+                                         "illegal vecmat operand shapes");
     }
 
     const int64_t DIM = 32; // TODO
@@ -202,13 +202,13 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
     auto C = dyn_cast<MemRefType>(matC.getType());
 
     if (!A || !B || !C) {
-      llvm::errs() << "A or B or C is not a MemRefType\n";
-      return failure();
+      return rewriter.notifyMatchFailure(matmulOp,
+                                         "expected memref operands");
     }
 
     if (!A.hasStaticShape() || !B.hasStaticShape() || !C.hasStaticShape()) {
-      llvm::errs() << "A or B or C is not a static shape\n";
-      return failure();
+      return rewriter.notifyMatchFailure(matmulOp,
+                                         "expected static operand shapes");
     }
 
     const int64_t DIM = 32; // TODO
@@ -232,7 +232,6 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
     auto bRowStride = getConstStride(B, 0); // N
     auto cRowStride = getConstStride(C, 0); // N
     if (aRowStride < 1 || bRowStride < 1 || cRowStride < 1) {
-      llvm::errs() << "dynamic/invalid row stride\n";
       return rewriter.notifyMatchFailure(matmulOp, "dynamic/invalid row stride");
     }
 

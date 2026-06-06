@@ -86,6 +86,7 @@ struct LLVMCPUPipelineOptions {
   bool enableAArch64SME = false;
   bool enableAArch64I8mm = false;
   bool lowerToAVX2 = false;
+  bool enableFlexiNpuTiling = false;
 };
 
 /// Wraps LLVMCPUPipelineOptions and loweringConfig for passing through
