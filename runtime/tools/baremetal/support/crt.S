@@ -132,7 +132,10 @@ _start:
   # VMFB and full IREE context need far more than the tiny 16MB test default.
   # NOTE: dispatch-bundle (-d) I/O uses static .bss gSharedBuf, not the
   # heap/stack, so STKSHIFT does not affect single-dispatch baremetal runs.
-#define STKSHIFT 30
+#ifndef IREE_BAREMETAL_STKSHIFT
+#define IREE_BAREMETAL_STKSHIFT 30
+#endif
+#define STKSHIFT IREE_BAREMETAL_STKSHIFT
   add sp, a0, 1
   sll sp, sp, STKSHIFT
   add sp, sp, tp

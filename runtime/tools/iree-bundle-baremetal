@@ -752,6 +752,15 @@ def main():
         help="Strip unneeded symbols from the resulting ELF.",
     )
     parser.add_argument(
+        "--stack-shift",
+        type=int,
+        default=None,
+        help=(
+            "Override the baremetal CRT stack/heap window size as log2(bytes). "
+            "The default keeps the CRT's built-in value."
+        ),
+    )
+    parser.add_argument(
         "--runner",
         choices=["direct", "tooling"],
         default="direct",
@@ -950,6 +959,8 @@ def main():
                     "-fno-section-anchors",
                 ]
             )
+            if source == "crt.S" and args.stack_shift is not None:
+                cmd.append(f"-DIREE_BAREMETAL_STKSHIFT={args.stack_shift}")
             if source == "syscalls.c":
                 cmd.extend(["-O1"])
             else:
