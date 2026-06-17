@@ -93,6 +93,7 @@ static func::FuncOp getOrCreateFunction(ModuleOp moduleOp,
 // Helper function to convert FlexiNPU types to numeric values
 static int32_t convertFlexiNPUType(flexinpu::FlexiNPUTypes type) {
   switch (type) {
+    case flexinpu::FlexiNPUTypes::i4: return 0;    // INT4 runtime value
     case flexinpu::FlexiNPUTypes::i8: return 1;    // INT8 runtime value
     case flexinpu::FlexiNPUTypes::i32: return 2;   // INT32 runtime value
     case flexinpu::FlexiNPUTypes::i64: return 3;   // INT64 runtime value
@@ -101,7 +102,7 @@ static int32_t convertFlexiNPUType(flexinpu::FlexiNPUTypes type) {
     case flexinpu::FlexiNPUTypes::f64: return 6;   // FP64 runtime value
     case flexinpu::FlexiNPUTypes::bf16: return 7;  // BF16 runtime value
   }
-  return 0; // default
+  return 5; // default FP32
 }
 
 static int32_t convertFlexiNPUMatType(flexinpu::FlexiNPUMatTypes matType) {

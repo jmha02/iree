@@ -137,9 +137,9 @@ _start:
 #endif
 #define STKSHIFT IREE_BAREMETAL_STKSHIFT
   add sp, a0, 1
-  sll sp, sp, STKSHIFT
+  slli sp, sp, STKSHIFT
   add sp, sp, tp
-  sll a2, a0, STKSHIFT
+  slli a2, a0, STKSHIFT
   add tp, tp, a2
 
   j _init

@@ -33,6 +33,9 @@
 extern volatile uint64_t tohost;
 extern volatile uint64_t fromhost;
 
+void printstr(const char* s);
+void printhex(uint64_t x);
+
 typedef struct iree_baremetal_vfs_file_t {
   const char* path;
   const uint8_t* data;
@@ -118,6 +121,9 @@ void setStats(int enable)
 
 void __attribute__((noreturn)) tohost_exit(uintptr_t code)
 {
+  printstr("[baremetal] tohost_exit code=0x");
+  printhex(code);
+  printstr("\n");
   tohost = (code << 1) | 1;
   while (1);
 }
@@ -268,6 +274,13 @@ void printhex(uint64_t x)
   printstr(str);
 }
 
+static void printlabelhex(const char* label, uint64_t x)
+{
+  printstr(label);
+  printhex(x);
+  printstr("\n");
+}
+
 static char* sbrk_heap_end;
 extern char _end;
 
@@ -282,6 +295,11 @@ void* _sbrk(ptrdiff_t incr) {
 
   if (incr > 0) {
     if (next + kStackGuardBytes > stack_ptr) {
+      printstr("[baremetal] sbrk ENOMEM\n");
+      printlabelhex("  prev=0x", (uintptr_t)prev);
+      printlabelhex("  next=0x", (uintptr_t)next);
+      printlabelhex("  sp=0x", (uintptr_t)stack_ptr);
+      printlabelhex("  incr=0x", (uintptr_t)incr);
       errno = ENOMEM;
       return (void*)-1;
     }

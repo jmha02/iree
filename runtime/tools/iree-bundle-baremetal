@@ -132,6 +132,10 @@ STRIP_CANDIDATES = (
     "llvm-strip",
     "riscv64-unknown-elf-strip",
 )
+NM_CANDIDATES = (
+    "llvm-nm",
+    "riscv64-unknown-elf-nm",
+)
 
 
 def parse_primitive_literal(spec: str, type_code: str) -> float:
@@ -313,7 +317,7 @@ def parse_tensor_spec(
 
 
 def extract_symbols(obj: Path, toolchain_root: Path) -> Tuple[str, str]:
-    nm = toolchain_root / "bin" / "llvm-nm"
+    nm = resolve_tool(toolchain_root, NM_CANDIDATES)
     output = run([str(nm), "--defined-only", str(obj)], capture_output=True)
     start_sym = None
     end_sym = None

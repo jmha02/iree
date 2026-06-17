@@ -1,0 +1,1114 @@
+#!/usr/bin/env python3
+"""
+Multi-dispatch direct-call benchmark builder.
+
+Builds a minimal bare-metal ELF that directly invokes specified dispatch
+kernels from a compiled VMFB, bypassing the IREE VM runtime overhead.
+
+Usage:
+  python3 dispatch_bench.py build/ivit/block_b0 --dispatches 2,3
+  python3 dispatch_bench.py build/ivit/block_b0 --dispatches 2,3 --run gemmini
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import zipfile
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+except ImportError:
+    class Console:
+        def print(self, *args, **kwargs):
+            text = " ".join(str(arg) for arg in args)
+            print(re.sub(r"\[[^]]+\]", "", text))
+
+    class Panel:
+        @staticmethod
+        def fit(text, border_style=None):
+            return text
+
+console = Console()
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+TYPE_TABLE = {
+    "bf16": ("IREE_HAL_ELEMENT_TYPE_BFLOAT_16", 2),
+    "f32": ("IREE_HAL_ELEMENT_TYPE_FLOAT_32", 4),
+    "f16": ("IREE_HAL_ELEMENT_TYPE_FLOAT_16", 2),
+    "i64": ("IREE_HAL_ELEMENT_TYPE_SINT_64", 8),
+    "i32": ("IREE_HAL_ELEMENT_TYPE_SINT_32", 4),
+    "i16": ("IREE_HAL_ELEMENT_TYPE_SINT_16", 2),
+    "i8": ("IREE_HAL_ELEMENT_TYPE_SINT_8", 1),
+    "u64": ("IREE_HAL_ELEMENT_TYPE_UINT_64", 8),
+    "u32": ("IREE_HAL_ELEMENT_TYPE_UINT_32", 4),
+    "u16": ("IREE_HAL_ELEMENT_TYPE_UINT_16", 2),
+    "u8": ("IREE_HAL_ELEMENT_TYPE_UINT_8", 1),
+}
+
+TYPE_ALIASES = {
+    "si64": "i64", "si32": "i32", "si16": "i16", "si8": "i8",
+    "ui64": "u64", "ui32": "u32", "ui16": "u16", "ui8": "u8",
+}
+
+TOOL_DIR = Path(__file__).resolve().parent
+IREE_ROOT = TOOL_DIR.parents[1]
+DISPATCH_RT_DIR = Path(
+    os.getenv("IREE_BUNDLE_DISPATCH_RT_DIR", str(TOOL_DIR / "dispatch"))
+)
+SCRIPT_DIR = DISPATCH_RT_DIR / "src"
+SUPPORT_DIR = Path(
+    os.getenv(
+        "IREE_BUNDLE_DISPATCH_SUPPORT_DIR",
+        str(TOOL_DIR / "baremetal" / "support"),
+    )
+)
+IREE_RUNTIME_SRC = IREE_ROOT / "runtime" / "src"
+
+FALLBACK_TOOLS = ("clang", "riscv64-unknown-elf-clang", "riscv64-unknown-elf-gcc")
+OBJCOPY_CANDIDATES = ("llvm-objcopy", "riscv64-unknown-elf-objcopy")
+NM_CANDIDATES = ("llvm-nm", "riscv64-unknown-elf-nm")
+
+COMMON_DEFINES = [
+    "-DIREE_PLATFORM_GENERIC=1",
+    "-DIREE_SYNCHRONIZATION_DISABLE_UNSAFE=1",
+    "-DIREE_FILE_IO_ENABLE=0",
+    "-DIREE_TIME_NOW_FN={ return 0; }",
+    "-DIREE_DEVICE_SIZE_T=uint64_t",
+    "-DPRIdsz=PRIu64",
+]
+
+# runtime/support/syscalls.c provides its own libc-like string helpers.
+# When built with aggressive optimization, builtin folding can rewrite the
+# local memset implementation into a recursive self-call.
+SUPPORT_NO_BUILTIN_FLAGS = [
+    "-fno-builtin",
+    "-fno-builtin-memcpy",
+    "-fno-builtin-memset",
+    "-fno-builtin-strlen",
+    "-fno-builtin-strnlen",
+    "-fno-builtin-strcmp",
+    "-fno-builtin-strcpy",
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def run_cmd(cmd: Sequence[str], *, capture: bool = False, cwd: Optional[Path] = None) -> str:
+    console.print(f"[dim]$ {' '.join(str(c) for c in cmd)}[/dim]")
+    result = subprocess.run(
+        [str(c) for c in cmd],
+        check=True,
+        cwd=str(cwd) if cwd else None,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        text=True,
+    )
+    return result.stdout if capture else ""
+
+
+def resolve_tool(toolchain_root: Path, candidates: Sequence[str]) -> Path:
+    for name in candidates:
+        tool = toolchain_root / "bin" / name
+        if tool.exists():
+            return tool
+    raise FileNotFoundError(f"none of {candidates} found under {toolchain_root / 'bin'}")
+
+
+def prepare_payload(path: Path, toolchain_root: Path, temp_dir: Path, prefix: str) -> Tuple[Path, str, str]:
+    objcopy = resolve_tool(toolchain_root, OBJCOPY_CANDIDATES)
+    out_obj = temp_dir / f"{prefix}.o"
+    run_cmd([
+        str(objcopy), "-I", "binary", "-O", "elf64-littleriscv",
+        "-B", "riscv:rv64",
+        "--set-section-alignment", ".data=16",
+        "--rename-section", ".data=.rodata",
+        str(path), str(out_obj),
+    ])
+    nm = resolve_tool(toolchain_root, NM_CANDIDATES)
+    nm_out = run_cmd([str(nm), "--defined-only", str(out_obj)], capture=True)
+    start_sym = end_sym = None
+    for line in nm_out.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        sym = parts[-1]
+        if sym.endswith("_start"):
+            start_sym = sym
+        elif sym.endswith("_end"):
+            end_sym = sym
+    if not start_sym or not end_sym:
+        raise RuntimeError(f"unable to find binary symbols in {out_obj}")
+    return out_obj, start_sym, end_sym
+
+
+# ---------------------------------------------------------------------------
+# VM.MLIR parser: extract dispatch descriptors
+# ---------------------------------------------------------------------------
+def parse_vm_dispatches(vm_mlir_path: Path) -> List[dict]:
+    """Parse vm.call.variadic hal.command_buffer.dispatch lines from vm.mlir.
+
+    Returns a list of dispatch descriptors in execution order, each with:
+      ordinal, workgroup_count, push_constants, bindings (list of dicts with
+      slot, binding_index, buffer_ref, offset, length).
+    """
+    text = vm_mlir_path.read_text()
+
+    export_names: List[str] = []
+    for m in re.finditer(
+        r'vm\.rodata\s+private\s+@_utf8_main(?:_async)?_dispatch_\S+'
+        r'\s+\{[^}]*\}\s+"([^"]+)"',
+        text,
+    ):
+        name = m.group(1)
+        if "dispatch" in name:
+            export_names.append(name)
+
+    # Collect constant definitions: %cN = vm.const.i32 VALUE
+    const_map: Dict[str, int] = {}
+    for m in re.finditer(r'%c(\S+)\s*=\s*vm\.const\.i(?:32|64)\s+(\d+)', text):
+        const_map[f"%c{m.group(1)}"] = int(m.group(2))
+    const_map["%zero"] = 0
+    const_map["%zero_0"] = 0
+
+    def resolve_const(tok: str) -> int:
+        tok = tok.strip()
+        if tok in const_map:
+            return const_map[tok]
+        # Try raw integer
+        try:
+            return int(tok)
+        except ValueError:
+            return 0
+
+    def resolve_ordinal(tok: str) -> int:
+        tok = tok.strip()
+        if tok in const_map:
+            return const_map[tok]
+        if tok.startswith("%") and tok[1:].isdigit():
+            return int(tok[1:])
+        try:
+            return int(tok)
+        except ValueError:
+            return 0
+
+    dispatches = []
+    # Match dispatch calls
+    for line in text.splitlines():
+        if "hal.command_buffer.dispatch" not in line:
+            continue
+        if "execution_barrier" in line or "finalize" in line:
+            continue
+        if "vm.import" in line:
+            continue
+
+        # Extract arguments between the parentheses after @hal.command_buffer.dispatch(
+        paren_start = line.find("(", line.find("dispatch"))
+        if paren_start < 0:
+            continue
+        # Find matching close paren considering nested parens
+        depth = 0
+        paren_end = paren_start
+        for i in range(paren_start, len(line)):
+            if line[i] == '(':
+                depth += 1
+            elif line[i] == ')':
+                depth -= 1
+                if depth == 0:
+                    paren_end = i
+                    break
+        args_str = line[paren_start + 1:paren_end]
+
+        # Split into top-level comma-separated tokens (respecting parens/brackets)
+        tokens = []
+        depth = 0
+        current = []
+        for ch in args_str:
+            if ch in ('(', '['):
+                depth += 1
+                current.append(ch)
+            elif ch in (')', ']'):
+                depth -= 1
+                current.append(ch)
+            elif ch == ',' and depth == 0:
+                tokens.append(''.join(current).strip())
+                current = []
+            else:
+                current.append(ch)
+        if current:
+            tokens.append(''.join(current).strip())
+
+        # Tokens layout (from vm.call.variadic signature):
+        # 0: command_buffer ref
+        # 1: executable ref
+        # 2: ordinal
+        # 3: workgroup_count_x
+        # 4: workgroup_count_y
+        # 5: workgroup_count_z
+        # 6: flags (i64)
+        # 7: push_constants [list]
+        # 8+: binding tuples (slot, binding_index, buffer_ref, offset, length)
+        if len(tokens) < 8:
+            continue
+
+        ordinal = resolve_ordinal(tokens[2])
+        export_name = export_names[ordinal] if 0 <= ordinal < len(export_names) else None
+        name_suffix = None
+        if export_name:
+            suffix_match = re.search(r'(?:async_)?dispatch_(\d+)', export_name)
+            if suffix_match:
+                name_suffix = int(suffix_match.group(1))
+        wg_x = resolve_const(tokens[3])
+        wg_y = resolve_const(tokens[4])
+        wg_z = resolve_const(tokens[5])
+
+        # Parse push constants from bracketed list
+        push_consts_str = tokens[7].strip()
+        push_constants = []
+        if push_consts_str.startswith("[") and push_consts_str.endswith("]"):
+            inner = push_consts_str[1:-1].strip()
+            if inner:
+                push_constants = [resolve_const(c.strip()) for c in inner.split(",")]
+
+        # Parse binding tuples from token[8] which is a bracketed list like:
+        # [(%zero, %c3, %null, %zero_0, %c37824), (%zero, %zero, %__const, %zero_0, %c484608)]
+        bindings = []
+        bindings_str = tokens[8].strip() if len(tokens) > 8 else "[]"
+        # Extract individual tuples from the bracketed list
+        tuple_pattern = re.finditer(r'\(([^)]+)\)', bindings_str)
+        for m in tuple_pattern:
+            parts = [p.strip() for p in m.group(1).split(",")]
+            if len(parts) >= 5:
+                bindings.append({
+                    "slot": resolve_const(parts[0]),
+                    "binding_index": resolve_const(parts[1]),
+                    "buffer_ref": parts[2],
+                    "offset": resolve_const(parts[3]),
+                    "length": resolve_const(parts[4]),
+                })
+
+        dispatches.append({
+            "ordinal": ordinal,
+            "export_ordinal": ordinal,
+            "symbol_name": export_name,
+            "name_suffix": name_suffix,
+            "workgroup_count": (wg_x, wg_y, wg_z),
+            "push_constants": push_constants,
+            "bindings": bindings,
+        })
+
+    return dispatches
+
+
+# ---------------------------------------------------------------------------
+# Parse benchmark dispatch MLIR to get binding shapes/types
+# ---------------------------------------------------------------------------
+def parse_benchmark_mlir(bench_dir: Path, dispatch_idx: int) -> dict:
+    """Parse the benchmark MLIR for a given dispatch ordinal to extract
+    binding shapes and types."""
+    globs = [
+        f"module_main$async_dispatch_{dispatch_idx}_*.mlir",
+        f"module_main_dispatch_{dispatch_idx}_*.mlir",
+    ]
+    matches = []
+    for g in globs:
+        matches.extend(bench_dir.glob(g))
+    if not matches:
+        return {}
+    mlir_text = sorted(matches)[0].read_text()
+
+    bindings = []
+    for line in mlir_text.splitlines():
+        if "hal.interface.binding.subspan" not in line:
+            continue
+        m_b = re.search(r"binding\((\d+)\)", line)
+        if not m_b:
+            continue
+        bindex = int(m_b.group(1))
+        is_output = ("writeonly" in line) or ("readwrite" in line)
+        if "tensor<" not in line and "memref<" not in line:
+            continue
+        for kind in ("tensor<", "memref<"):
+            if kind in line:
+                shape_type = line.split(kind)[-1].split(">")[0].strip()
+                break
+        dims_tokens = shape_type.split("x")
+        element_token = dims_tokens[-1]
+        element_token = TYPE_ALIASES.get(element_token, element_token)
+        dims = []
+        for t in dims_tokens[:-1]:
+            t = t.strip()
+            if t.lstrip("-").isdigit():
+                dims.append(int(t))
+        if element_token not in TYPE_TABLE:
+            continue
+        element_const, element_size = TYPE_TABLE[element_token]
+        elem_count = 1
+        for d in dims:
+            elem_count *= d
+        bindings.append({
+            "index": bindex,
+            "dims": dims,
+            "element_token": element_token,
+            "element_const": element_const,
+            "element_size": element_size,
+            "element_count": elem_count,
+            "is_output": is_output,
+        })
+
+    return {"bindings": sorted(bindings, key=lambda b: b["index"])}
+
+
+# ---------------------------------------------------------------------------
+# Generate the multi_dispatch_spec.c
+# ---------------------------------------------------------------------------
+def generate_spec_c(
+    dispatches: List[dict],
+    query_symbol: str,
+    extern_symbols: List[dict],
+    print_limit: int,
+) -> str:
+    """Generate a C source file implementing multi_dispatch_acquire_spec()."""
+    lines = []
+    lines.append('#include <stdbool.h>')
+    lines.append('#include "multi_dispatch_spec.h"')
+    lines.append('')
+
+    # Extern: query function
+    lines.append(f'extern const iree_hal_executable_library_header_t** {query_symbol}(')
+    lines.append('    iree_hal_executable_library_version_t max_version,')
+    lines.append('    const iree_hal_executable_environment_v0_t* environment);')
+    lines.append('')
+
+    # Extern: embedded binary data symbols
+    for sym in extern_symbols:
+        lines.append(f'extern const uint8_t {sym["start"]}[];')
+        lines.append(f'extern const uint8_t {sym["end"]}[];')
+    lines.append('')
+
+    # Per-dispatch static data
+    for di, d in enumerate(dispatches):
+        prefix = f"d{di}"
+
+        # Output shape arrays and type labels
+        for oi, out in enumerate(d.get("outputs", [])):
+            dims = out["dims"]
+            if dims:
+                dims_str = ", ".join(str(x) for x in dims)
+                lines.append(f'static const int64_t k{prefix}_out{oi}_shape[] = {{ {dims_str} }};')
+            lines.append(f'static const char k{prefix}_out{oi}_type_label[] = "{out["element_token"]}";')
+
+        # Output descriptors — buffer data pointer is wired at init time
+        if d.get("outputs"):
+            lines.append(f'static multi_dispatch_output_desc_t k{prefix}_outputs[] = {{')
+            for oi, out in enumerate(d.get("outputs", [])):
+                buf_size = out["element_size"] * max(out["element_count"], 1)
+                shape_ptr = f"k{prefix}_out{oi}_shape" if out["dims"] else "NULL"
+                shape_rank = len(out["dims"])
+                lines.append(f'  {{')
+                lines.append(f'    .element_type = {out["element_const"]},')
+                lines.append(f'    .element_type_label = k{prefix}_out{oi}_type_label,')
+                lines.append(f'    .element_size = (size_t){out["element_size"]},')
+                lines.append(f'    .element_count = (size_t){out["element_count"]},')
+                lines.append(f'    .shape_rank = {shape_rank},')
+                lines.append(f'    .shape_dims = {shape_ptr},')
+                lines.append(f'    .buffer = {{ .data = NULL, .length = (size_t){buf_size} }},')
+                lines.append(f'  }},')
+            lines.append(f'}};')
+
+        # Push constants
+        if d.get("push_constants"):
+            consts_str = ", ".join(str(c) for c in d["push_constants"])
+            lines.append(f'static const uint32_t k{prefix}_constants[] = {{ {consts_str} }};')
+
+        # Binding lengths
+        lines.append(f'static const size_t k{prefix}_binding_lengths[] = {{')
+        for b in d["bindings_layout"]:
+            lines.append(f'  (size_t){b["length"]},')
+        lines.append(f'}};')
+
+        # Binding pointers (filled at init time)
+        lines.append(f'static void* k{prefix}_binding_ptrs[{len(d["bindings_layout"])}] = {{0}};')
+        lines.append('')
+
+        # Label
+        label = d.get("symbol_name") or f'd{d["ordinal"]}'
+        label = label.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'static const char k{prefix}_label[] = "{label}";')
+        lines.append('')
+
+    # Dispatch descriptors array
+    lines.append(f'static const multi_dispatch_desc_t kDispatches[] = {{')
+    for di, d in enumerate(dispatches):
+        prefix = f"d{di}"
+        wg_size = "1, 1, 1"
+        wg_count = ", ".join(str(x) for x in d["workgroup_count"])
+        consts_ptr = f"k{prefix}_constants" if d.get("push_constants") else "NULL"
+        const_count = len(d.get("push_constants", []))
+        outputs_ptr = f"k{prefix}_outputs" if d.get("outputs") else "NULL"
+        output_count = len(d.get("outputs", []))
+        has_outputs = output_count > 0
+        should_print_outputs = has_outputs
+        lines.append(f'  {{')
+        lines.append(f'    .label = k{prefix}_label,')
+        lines.append(f'    .export_ordinal = {d.get("export_ordinal", d["ordinal"])},')
+        lines.append(f'    .workgroup_size = {{ {wg_size} }},')
+        lines.append(f'    .workgroup_count = {{ {wg_count} }},')
+        lines.append(f'    .max_concurrency = 1,')
+        lines.append(f'    .constants = {consts_ptr},')
+        lines.append(f'    .constant_count = (size_t){const_count},')
+        lines.append(f'    .binding_ptrs = k{prefix}_binding_ptrs,')
+        lines.append(f'    .binding_lengths = k{prefix}_binding_lengths,')
+        lines.append(f'    .binding_count = (size_t){len(d["bindings_layout"])},')
+        lines.append(f'    .output_count = (size_t){output_count},')
+        lines.append(f'    .outputs = {outputs_ptr},')
+        lines.append(f'    .print_outputs = {"true" if should_print_outputs else "false"},')
+        lines.append(f'    .print_limit = (size_t){print_limit},')
+        lines.append(f'  }},')
+    lines.append(f'}};')
+    lines.append('')
+
+    # Bundle spec
+    lines.append(f'static multi_dispatch_bundle_spec_t gSpec = {{')
+    lines.append(f'  .query_fn = {query_symbol},')
+    lines.append(f'  .dispatch_count = (size_t){len(dispatches)},')
+    lines.append(f'  .dispatches = kDispatches,')
+    lines.append(f'}};')
+    lines.append('')
+
+    # Initialize function: wire up binding pointers and output descriptors
+    lines.append('static void multi_dispatch_initialize(void) {')
+    lines.append('  static _Bool initialized = 0;')
+    lines.append('  if (initialized) return;')
+    for di, d in enumerate(dispatches):
+        prefix = f"d{di}"
+        for b in d["bindings_layout"]:
+            if b.get("data_source") == "extern":
+                lines.append(f'  k{prefix}_binding_ptrs[{b["local_index"]}] = (void*){b["extern_start"]};')
+            elif b.get("data_source") == "buffer":
+                lines.append(f'  k{prefix}_binding_ptrs[{b["local_index"]}] = (void*){b["buffer_var"]};')
+        # Wire output descriptors to their shared buffers
+        for oi, out in enumerate(d.get("outputs", [])):
+            buf_var = out.get("buffer_var")
+            if buf_var:
+                lines.append(f'  k{prefix}_outputs[{oi}].buffer.data = (void*){buf_var};')
+    lines.append('  initialized = 1;')
+    lines.append('}')
+    lines.append('')
+
+    lines.append('const multi_dispatch_bundle_spec_t* multi_dispatch_acquire_spec(void) {')
+    lines.append('  multi_dispatch_initialize();')
+    lines.append('  return &gSpec;')
+    lines.append('}')
+    lines.append('')
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Build shared buffer map across dispatches
+# ---------------------------------------------------------------------------
+def build_dispatch_layout(
+    vm_dispatches: List[dict],
+    selected_ordinals: List[int],
+    bench_dir: Path,
+    const_sym: dict,
+    input_syms: Sequence[dict],
+) -> Tuple[List[dict], List[dict]]:
+    """Build the per-dispatch binding layouts with shared intermediate buffers.
+
+    In vm.mlir, each dispatch's binding list has entries:
+      (slot, hal_binding_index, buffer_ref, offset, length)
+    The dispatch-local index is the position in this list (0, 1, 2, ...).
+
+    Buffer identity:
+      - buffer_ref containing '%__constant' → constant pool (embedded)
+      - buffer_ref == '%null' → transient HAL buffer identified by hal_binding_index
+
+    Returns (dispatch_specs, shared_buffers).
+    """
+    # Filter to selected dispatches (preserve order of selected_ordinals)
+    # Use first occurrence of each ordinal (same ordinal can be called
+    # multiple times with different parameters in the execution sequence)
+    ordinal_to_dispatch = {}
+    for d in vm_dispatches:
+        if d["ordinal"] in selected_ordinals and d["ordinal"] not in ordinal_to_dispatch:
+            ordinal_to_dispatch[d["ordinal"]] = d
+    selected = [ordinal_to_dispatch[o] for o in selected_ordinals if o in ordinal_to_dispatch]
+    missing_ordinals = [o for o in selected_ordinals if o not in ordinal_to_dispatch]
+    if missing_ordinals:
+        raise ValueError(f"dispatch ordinals not found in vm.mlir: {missing_ordinals}")
+
+    # Get benchmark MLIR info for each dispatch (for output detection & types)
+    bench_info = {}
+    for d in selected:
+        ordinal = d["ordinal"]
+        bench_idx = d.get("name_suffix") if d.get("name_suffix") is not None else ordinal
+        info = parse_benchmark_mlir(bench_dir, bench_idx)
+        if info:
+            bench_info[ordinal] = info
+
+    # Identify read-only input bindings of the first selected dispatch in
+    # dispatch-local order and map the provided payloads onto them.
+    # A binding tuple is constant if its buffer_ref contains '%__constant';
+    # other tuples sharing the same hal_binding_index may still be inputs.
+    input_hal_indices: Dict[int, dict] = {}
+    if input_syms and selected:
+        first_d = selected[0]
+        first_bench = bench_info.get(first_d["ordinal"], {}).get("bindings", [])
+        read_only_hal_indices: List[int] = []
+        for local_idx, b in enumerate(first_d["bindings"]):
+            if "%__constant" in b["buffer_ref"]:
+                continue
+            # Check benchmark info: is this binding read-only?
+            is_output = False
+            for bi in first_bench:
+                if bi["index"] == local_idx and bi["is_output"]:
+                    is_output = True
+                    break
+            if not is_output:
+                read_only_hal_indices.append(b["binding_index"])
+
+        if len(input_syms) > len(read_only_hal_indices):
+            raise ValueError(
+                f"received {len(input_syms)} input payloads, but only "
+                f"{len(read_only_hal_indices)} read-only input bindings were found "
+                f"for dispatch {first_d['ordinal']}"
+            )
+
+        for idx, input_sym in enumerate(input_syms):
+            input_hal_indices[read_only_hal_indices[idx]] = input_sym
+
+    # Collect all transient buffer sizes (keyed by hal_binding_index)
+    transient_sizes: Dict[int, int] = {}
+    for d in selected:
+        for b in d["bindings"]:
+            if "%__constant" in b["buffer_ref"]:
+                continue
+            hi = b["binding_index"]
+            size = b["offset"] + b["length"]
+            transient_sizes[hi] = max(transient_sizes.get(hi, 0), size)
+
+    # Allocate shared buffers for transient hal_binding_indices
+    # (excluding extern inputs, which come from embedded payloads)
+    shared_buffers = []
+    buffer_var_map: Dict[int, str] = {}
+    for hi, size in sorted(transient_sizes.items()):
+        if hi in input_hal_indices:
+            continue
+        var_name = f"gSharedBuf_{hi}"
+        buffer_var_map[hi] = var_name
+        shared_buffers.append({"var_name": var_name, "size": size})
+
+    # Build per-dispatch specs
+    dispatch_specs = []
+    for d in selected:
+        ordinal = d["ordinal"]
+        bindings_layout = []
+        outputs = []
+
+        # Benchmark binding info keyed by dispatch-local index
+        binfo_list = bench_info.get(ordinal, {}).get("bindings", [])
+        # De-duplicate: keep only the first entry per index (multiple sub-spans
+        # at the same binding index are sub-views into the same buffer)
+        binfo_map: Dict[int, dict] = {}
+        for bi in binfo_list:
+            if bi["index"] not in binfo_map:
+                binfo_map[bi["index"]] = bi
+
+        # Build binding layout — all transient buffers use shared buffers.
+        # Output bindings also point to shared buffers so cross-dispatch
+        # data flow works (d2 output in gSharedBuf_4 feeds d3 input).
+        for local_idx, b in enumerate(d["bindings"]):
+            hi = b["binding_index"]
+            total_size = b["offset"] + b["length"]
+            entry: dict = {
+                "local_index": local_idx,
+                "hal_binding_index": hi,
+                "length": total_size,
+            }
+
+            if "%__constant" in b["buffer_ref"]:
+                entry["data_source"] = "extern"
+                entry["extern_start"] = const_sym["start"]
+            elif hi in input_hal_indices:
+                entry["data_source"] = "extern"
+                entry["extern_start"] = input_hal_indices[hi]["start"]
+            elif hi in buffer_var_map:
+                entry["data_source"] = "buffer"
+                entry["buffer_var"] = buffer_var_map[hi]
+            else:
+                var_name = f"gSharedBuf_{hi}"
+                buffer_var_map[hi] = var_name
+                shared_buffers.append({"var_name": var_name, "size": total_size})
+                entry["data_source"] = "buffer"
+                entry["buffer_var"] = var_name
+
+            bindings_layout.append(entry)
+
+        # Identify outputs from benchmark info and create output descriptors
+        # These reference the same shared buffer for cross-dispatch data flow
+        for local_idx, b in enumerate(d["bindings"]):
+            binfo = binfo_map.get(local_idx)
+            if binfo and binfo["is_output"]:
+                hi = b["binding_index"]
+                buf_var = buffer_var_map.get(hi)
+                outputs.append({
+                    "dims": binfo["dims"],
+                    "element_token": binfo["element_token"],
+                    "element_const": binfo["element_const"],
+                    "element_size": binfo["element_size"],
+                    "element_count": binfo["element_count"],
+                    "buffer_var": buf_var,  # for output descriptor data ptr
+                })
+
+        dispatch_specs.append({
+            "ordinal": ordinal,
+            "export_ordinal": d.get("export_ordinal", ordinal),
+            "symbol_name": d.get("symbol_name"),
+            "name_suffix": d.get("name_suffix"),
+            "workgroup_count": d["workgroup_count"],
+            "push_constants": d["push_constants"],
+            "bindings_layout": bindings_layout,
+            "outputs": outputs,
+        })
+
+    return dispatch_specs, shared_buffers
+
+
+# ---------------------------------------------------------------------------
+# Main build pipeline
+# ---------------------------------------------------------------------------
+def main():
+    parser = argparse.ArgumentParser(
+        description="Bundle selected VM dispatch ordinals from a compiled build directory.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("build_dir", help="Build directory (e.g., build/ivit/block_b0)")
+    parser.add_argument("--dispatches", required=True,
+                        help="Comma-separated VM export ordinals to include (e.g., 2,3)")
+    parser.add_argument("--input-data", action="append", default=[],
+                        help="Path to input data file for the first selected dispatch's read-only bindings in order")
+    parser.add_argument("--output", default=None,
+                        help="Output ELF path (default: <output-dir>/dispatch_bench.elf)")
+    parser.add_argument("--output-dir", default=None,
+                        help="Output directory (default: <build_dir>/dispatch_bench)")
+    parser.add_argument("--print-limit", type=int, default=16,
+                        help="Max elements to print per output (0=hash only)")
+    parser.add_argument("--march", default="rv64gc", help="Target ISA")
+    parser.add_argument("--mabi", default="lp64d", help="Target ABI")
+    parser.add_argument("--toolchain-root", default=os.environ.get("RISCV"),
+                        help="RISC-V toolchain root")
+    parser.add_argument("--run", default=None, metavar="EXTENSION",
+                        help="Run on Spike after building (e.g., gemmini)")
+    parser.add_argument("--rtl", action="store_true",
+                        help="Print RTL simulation command instead of Spike")
+    parser.add_argument("--harness", default=None,
+                        help="RTL harness config (default: auto from extension)")
+    parser.add_argument("-v", "--verbose", action="store_true",
+                        help="Verbose Spike output")
+    parser.add_argument("--vlen", type=int, default=512, help="Vector length for Spike")
+    parser.add_argument("--spec-only", action="store_true",
+                        help="Only generate the spec C file, do not build")
+
+    args = parser.parse_args()
+
+    if not args.toolchain_root:
+        console.print("[red]$RISCV not set and --toolchain-root not provided[/red]")
+        sys.exit(1)
+
+    build_dir = Path(args.build_dir).resolve()
+    toolchain_root = Path(args.toolchain_root).resolve()
+    selected_ordinals = [int(x.strip()) for x in args.dispatches.split(",") if x.strip()]
+    if not selected_ordinals:
+        console.print("[red]--dispatches must not be empty[/red]")
+        sys.exit(1)
+
+    if args.output:
+        elf_path = Path(args.output).expanduser().resolve()
+        out_dir = elf_path.parent
+    else:
+        out_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else build_dir / "dispatch_bench"
+        elf_path = out_dir / "dispatch_bench.elf"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    vmfb_path = build_dir / "module.vmfb"
+    if not vmfb_path.exists():
+        console.print(f"[red]VMFB not found: {vmfb_path}[/red]")
+        sys.exit(1)
+
+    console.print(Panel.fit(
+        f"[bold cyan]Multi-Dispatch Benchmark Builder[/bold cyan]\n"
+        f"Build dir: [bold]{build_dir}[/bold]\n"
+        f"Dispatches: [bold]{selected_ordinals}[/bold]",
+        border_style="cyan",
+    ))
+
+    # --- Step 1: Find vm.mlir phase ---
+    vm_mlir_candidates = sorted(build_dir.glob("phases/*.vm.mlir"))
+    if not vm_mlir_candidates:
+        console.print("[red]No vm.mlir phase file found[/red]")
+        sys.exit(1)
+    vm_mlir = vm_mlir_candidates[-1]
+    console.print(f"[cyan]Using vm.mlir:[/cyan] {vm_mlir.name}")
+
+    # --- Step 2: Parse all dispatches from vm.mlir ---
+    all_dispatches = parse_vm_dispatches(vm_mlir)
+    console.print(f"[cyan]Parsed {len(all_dispatches)} dispatches from vm.mlir[/cyan]")
+
+    for d in all_dispatches:
+        if d["ordinal"] in selected_ordinals:
+            console.print(
+                f"  d{d['ordinal']}: {d.get('symbol_name') or ''} "
+                f"workgroup={d['workgroup_count']} "
+                f"push_constants={d['push_constants']} "
+                f"bindings={len(d['bindings'])}"
+            )
+
+    # --- Step 3: Extract constants from VMFB ---
+    const_bin_path = out_dir / "_const.bin"
+    with zipfile.ZipFile(vmfb_path, 'r') as zf:
+        if "_const.bin" in zf.namelist():
+            with zf.open("_const.bin") as src, open(const_bin_path, "wb") as dst:
+                dst.write(src.read())
+            console.print(f"[green]Extracted _const.bin ({const_bin_path.stat().st_size} bytes)[/green]")
+        else:
+            console.print("[yellow]No _const.bin in VMFB (no constants pool)[/yellow]")
+            const_bin_path = None
+
+    # --- Step 4: Find inner ELF .o ---
+    # intms/ is not wiped between compiles, so objects from earlier runs
+    # (often under a different module name) can linger. Their dispatch
+    # ordinals/binding ABI won't match the spec we just generated from the
+    # current phases/, producing out-of-bounds binding_ptrs reads at runtime.
+    # Pick the most recently modified linked module object so we always link
+    # the object from the compile that produced the current phases/.
+    intms_dir = build_dir / "intms"
+    linked_objs = sorted(
+        intms_dir.glob("*_linked_embedded_elf_*.o"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    inner_objs = linked_objs or sorted(
+        intms_dir.glob("*.o"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not inner_objs:
+        console.print("[red]No .o files found in intms/[/red]")
+        sys.exit(1)
+    inner_obj = inner_objs[0]
+    if len(inner_objs) > 1:
+        console.print(
+            f"[yellow]Multiple linked objects in intms/; using newest "
+            f"({inner_obj.name}), ignoring "
+            f"{', '.join(o.name for o in inner_objs[1:])}[/yellow]"
+        )
+    console.print(f"[cyan]Inner ELF object:[/cyan] {inner_obj.name}")
+
+    # Find query symbol from inner object
+    nm = resolve_tool(toolchain_root, NM_CANDIDATES)
+    nm_out = run_cmd([str(nm), "--defined-only", str(inner_obj)], capture=True)
+    query_symbol = "iree_hal_executable_library_query"
+    for line in nm_out.splitlines():
+        parts = line.split()
+        if parts and parts[-1].endswith("_library_query"):
+            query_symbol = parts[-1]
+            break
+    console.print(f"[cyan]Query symbol:[/cyan] {query_symbol}")
+
+    # --- Step 5: Build with tempdir ---
+    bench_dir = build_dir / "benchmarks"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        temp_dir = Path(tmpdir)
+
+        # Prepare constant pool payload
+        const_sym = None
+        const_payload_obj = None
+        if const_bin_path:
+            const_payload_obj, const_start, const_end = prepare_payload(
+                const_bin_path, toolchain_root, temp_dir, "const"
+            )
+            const_sym = {"start": const_start, "end": const_end}
+
+        # Prepare input data payloads in first-dispatch binding order.
+        input_syms: List[dict] = []
+        input_payload_objs: List[Path] = []
+        for idx, input_data in enumerate(args.input_data):
+            input_path = Path(input_data).expanduser().resolve()
+            if not input_path.exists():
+                console.print(f"[red]Input data not found: {input_path}[/red]")
+                sys.exit(1)
+            input_payload_obj, inp_start, inp_end = prepare_payload(
+                input_path, toolchain_root, temp_dir, f"input{idx}"
+            )
+            input_payload_objs.append(input_payload_obj)
+            input_syms.append({"start": inp_start, "end": inp_end})
+
+        # Build dispatch layout
+        dispatch_specs, shared_buffers = build_dispatch_layout(
+            all_dispatches, selected_ordinals, bench_dir,
+            const_sym if const_sym else {"start": "NULL", "end": "NULL"},
+            input_syms,
+        )
+
+        # Collect extern symbols
+        extern_symbols = []
+        if const_sym:
+            extern_symbols.append(const_sym)
+        extern_symbols.extend(input_syms)
+
+        # Generate spec C source
+        spec_c = generate_spec_c(
+            dispatch_specs, query_symbol, extern_symbols, args.print_limit,
+        )
+
+        # Insert shared buffer declarations after the extern symbols
+        shared_decls = []
+        for sb in shared_buffers:
+            shared_decls.append(f'static uint8_t {sb["var_name"]}[{sb["size"]}] = {{0}};')
+        if shared_decls:
+            # Insert after the extern block
+            insert_marker = "\n// Shared intermediate buffers\n"
+            insert_text = insert_marker + "\n".join(shared_decls) + "\n"
+            # Find position after last extern line
+            extern_end = spec_c.rfind("extern const uint8_t")
+            if extern_end >= 0:
+                next_nl = spec_c.index("\n", spec_c.index("\n", extern_end) + 1)
+                spec_c = spec_c[:next_nl] + "\n" + insert_text + spec_c[next_nl:]
+            else:
+                # Put after includes
+                include_end = spec_c.rfind('#include')
+                next_nl = spec_c.index("\n", include_end)
+                spec_c = spec_c[:next_nl + 1] + insert_text + spec_c[next_nl + 1:]
+
+        spec_path = out_dir / "multi_dispatch_spec.c"
+        spec_path.write_text(spec_c)
+        console.print(f"[green]Generated {spec_path}[/green]")
+
+        if args.spec_only:
+            console.print("[cyan]--spec-only: stopping after spec generation[/cyan]")
+            return
+
+        # --- Compile ---
+        cc_path = resolve_tool(toolchain_root, FALLBACK_TOOLS)
+        include_dirs = [SCRIPT_DIR, DISPATCH_RT_DIR, IREE_RUNTIME_SRC]
+
+        def make_compile(src: Path, out: Path) -> List[str]:
+            cmd = [
+                str(cc_path),
+                f"-march={args.march}", f"-mabi={args.mabi}",
+                "-mcmodel=medany", "-std=gnu11",
+                "-c", str(src), "-o", str(out),
+                "-ffreestanding", "-fdata-sections", "-ffunction-sections",
+            ]
+            for inc in include_dirs:
+                cmd.extend(["-I", str(inc)])
+            cmd.extend(COMMON_DEFINES)
+            cmd.append("-DIREE_HAL_RISCV_MEASURE_CYCLES=1")
+            cmd.extend(["-O3", "-DNDEBUG"])
+            return cmd
+
+        # Compile entry
+        entry_obj = temp_dir / "multi_dispatch_entry.o"
+        run_cmd(make_compile(SCRIPT_DIR / "multi_dispatch_entry.c", entry_obj))
+
+        # Compile spec
+        spec_obj = temp_dir / "multi_dispatch_spec.o"
+        run_cmd(make_compile(spec_path, spec_obj))
+
+        # Compile support (crt.S, syscalls.c)
+        support_objects = []
+        for source in ("crt.S", "syscalls.c"):
+            obj = temp_dir / f"{Path(source).stem}.o"
+            cmd = [
+                str(cc_path),
+                f"-march={args.march}", f"-mabi={args.mabi}",
+                "-mcmodel=medany", "-c",
+                str(SUPPORT_DIR / source), "-o", str(obj),
+                "-I", str(SUPPORT_DIR), "-std=gnu11",
+            ]
+            if source == "syscalls.c":
+                cmd.extend(SUPPORT_NO_BUILTIN_FLAGS)
+                cmd.extend(["-Wno-implicit-function-declaration", "-Wno-format"])
+            cmd.extend(COMMON_DEFINES)
+            cmd.extend(["-O3", "-DNDEBUG"])
+            run_cmd(cmd)
+            support_objects.append(obj)
+
+        # Compile riscv_cycle_measure.c (without -ffreestanding so PRIu64 works)
+        cycle_measure_src = IREE_RUNTIME_SRC / "iree" / "hal" / "riscv_cycle_measure.c"
+        cycle_measure_obj = temp_dir / "riscv_cycle_measure.o"
+        cycle_cmd = [
+            str(cc_path),
+            f"-march={args.march}", f"-mabi={args.mabi}",
+            "-mcmodel=medany", "-std=gnu11",
+            "-c", str(cycle_measure_src), "-o", str(cycle_measure_obj),
+            "-fdata-sections", "-ffunction-sections",
+        ]
+        for inc in include_dirs:
+            cycle_cmd.extend(["-I", str(inc)])
+        cycle_cmd.extend(COMMON_DEFINES)
+        cycle_cmd.append("-DIREE_HAL_RISCV_MEASURE_CYCLES=1")
+        cycle_cmd.extend(["-O3", "-DNDEBUG"])
+        run_cmd(cycle_cmd)
+
+        # --- Link ---
+        link_cmd = [
+            str(cc_path),
+            f"-march={args.march}", f"-mabi={args.mabi}",
+            "-mcmodel=medany",
+            "-nostdlib", "-nostartfiles", "-static",
+            "-Wl,--no-relax",
+            "-Wl,-T," + str(SUPPORT_DIR / "test.ld"),
+            "-Wl,-Map=" + str(temp_dir / "link.map"),
+            "-o", str(elf_path),
+            "-Wl,--gc-sections",
+            "-Wl,--start-group",
+        ]
+
+        lib_search = [toolchain_root / "riscv64-unknown-elf" / "lib"]
+        gcc_base = toolchain_root / "lib" / "gcc" / "riscv64-unknown-elf"
+        if gcc_base.exists():
+            versions = sorted([p for p in gcc_base.iterdir() if p.is_dir()], reverse=True)
+            lib_search.extend(versions)
+        for lib_dir in lib_search:
+            if lib_dir.exists():
+                link_cmd.extend(["-L", str(lib_dir)])
+
+        link_cmd.extend(str(o) for o in support_objects)
+        link_cmd.extend([str(entry_obj), str(spec_obj), str(cycle_measure_obj)])
+        if const_payload_obj:
+            link_cmd.append(str(const_payload_obj))
+        link_cmd.extend(str(o) for o in input_payload_objs)
+        link_cmd.append(str(inner_obj))
+        link_cmd.extend(["-O3", "-lm", "-lc", "-lgcc", "-Wl,--end-group"])
+
+        run_cmd(link_cmd)
+
+        # Copy link map for debug
+        link_map = temp_dir / "link.map"
+        if link_map.exists():
+            shutil.copy2(link_map, out_dir / "link.map")
+
+    console.print(f"[green]Dispatch benchmark ELF: {elf_path}[/green]")
+
+    # --- Optional: run on Spike ---
+    if args.run:
+        ext = args.run
+        ext_cmd = f"--extension={ext}"
+        stdout_path = out_dir / "spike_out.txt"
+        stderr_path = out_dir / "spike_err.txt"
+
+        spike_cmd = [
+            "spike", ext_cmd,
+            f"--isa=rv64gcv_zvl{args.vlen}b_zicsr_zifencei_zicntr_zihpm",
+            str(elf_path),
+        ]
+        console.print(f"\n[cyan]Running on Spike...[/cyan]")
+        console.print(f"[dim]$ {' '.join(spike_cmd)}[/dim]")
+
+        with open(stdout_path, "w") as out_f:
+            proc = subprocess.Popen(
+                spike_cmd,
+                stdout=subprocess.PIPE,
+                stderr=open(stderr_path, "w"),
+                text=True,
+            )
+            for line in proc.stdout:
+                print(line, end="")
+                out_f.write(line)
+            proc.wait()
+
+        if proc.returncode != 0:
+            # Baremetal Spike often exits with 255 due to syscall issues
+            # after successful execution. Check if we got cycle output.
+            stdout_text = stdout_path.read_text()
+            if "prologue:" in stdout_text or "kernel" in stdout_text:
+                console.print(f"[yellow]Spike exited with code {proc.returncode} (expected for baremetal)[/yellow]")
+            else:
+                console.print(f"[red]Spike failed with code {proc.returncode}[/red]")
+                console.print(f"[dim]stderr: {stderr_path}[/dim]")
+                sys.exit(proc.returncode)
+        else:
+            console.print(f"[green]Spike run complete[/green]")
+        console.print(f"[dim]stdout: {stdout_path}[/dim]")
+
+    # --- Optional: print RTL simulation command ---
+    if args.rtl:
+        ext = args.run or "gemmini"
+        harness = args.harness
+        if not harness:
+            harness_map = {
+                "flexinpu": "FlexiNPUConfig",
+                "flexi": "FlexiNPUConfig",
+                "gemmini": "BigRocketSaturnGemminiConfig",
+                "fpgemmini": "BigRocketSaturnFPGemminiConfig",
+            }
+            harness = harness_map.get(ext, "RocketConfig")
+
+        cydir = os.environ.get("CHIPYARD_DIR", "")
+        if not cydir:
+            console.print("[red]$CHIPYARD_DIR not set, please source env.sh[/red]")
+            sys.exit(1)
+
+        harness_bin = f"{cydir}/sims/verilator/simulator-chipyard.harness-{harness}"
+        dramsim2_ini_dir = f"{cydir}/generators/testchipip/src/main/resources/dramsim2_ini"
+
+        stdout_path = out_dir / "rtl_out.txt"
+        stderr_path = out_dir / "rtl_err.txt"
+
+        numa_prefix = f"{cydir}/scripts/numa_prefix"
+        try:
+            numactl = subprocess.check_output(numa_prefix, shell=True, text=True).strip()
+        except Exception:
+            numactl = ""
+
+        cmd_parts = [
+            numactl or harness_bin,
+        ]
+        if numactl:
+            cmd_parts.append(harness_bin)
+        cmd_parts.extend([
+            "+permissive",
+            "+dramsim",
+            f"+dramsim_ini_dir={dramsim2_ini_dir}",
+            "+max-cycles=1000000000",
+            f"+loadmem={elf_path}",
+            "+verbose",
+            "+permissive-off",
+            str(elf_path),
+            f"< /dev/null",
+            f"2> >(spike-dasm > {stderr_path}) | tee {stdout_path}",
+        ])
+
+        console.print(f"\n[yellow]Run following RTL command manually:[/yellow]")
+        print(" \\\n\t".join(cmd_parts))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except subprocess.CalledProcessError as exc:
+        if exc.stderr:
+            sys.stderr.write(exc.stderr)
+        elif exc.stdout:
+            sys.stderr.write(exc.stdout)
+        sys.exit(exc.returncode)
+    except Exception as exc:
+        sys.stderr.write(f"error: {exc}\n")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)

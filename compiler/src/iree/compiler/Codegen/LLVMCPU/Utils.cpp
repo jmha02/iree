@@ -101,6 +101,10 @@ bool hasFlexiNPUFeature(DictionaryAttr targetConfig) {
   return hasFeature(targetConfig, "+flexinpu");
 }
 
+bool hasFlexiNPUInt4Feature(DictionaryAttr targetConfig) {
+  return hasFeature(targetConfig, "+flexinpu-int4");
+}
+
 bool isLinalgGeneric2DTranspose(linalg::GenericOp genericOp) {
   // Check op has 2 dimensions.
   if (genericOp.getNumLoops() != 2) {

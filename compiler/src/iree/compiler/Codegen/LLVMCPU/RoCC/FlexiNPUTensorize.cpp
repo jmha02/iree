@@ -10,6 +10,7 @@
 
 #include "iree/compiler/Codegen/LLVMCPU/RoCC/Passes.h"
 #include "iree/compiler/Codegen/LLVMCPU/RoCC/Utils/Utils.h"
+#include "iree/compiler/Codegen/LLVMCPU/Utils.h"
 #include "iree/compiler/Dialect/FlexiNPU/IR/FlexiNPUDialect.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -38,6 +39,35 @@ namespace {
       }
     }
     return rewriter.create<arith::ConstantIndexOp>(loc, 0);
+  }
+
+  static bool isFlexiNPUInt4ElementType(Type type) {
+    auto intType = dyn_cast<IntegerType>(type);
+    if (!intType)
+      return false;
+    return intType.getWidth() == 4 || intType.getWidth() == 8;
+  }
+
+  static int64_t flexiTileDim(Type elemTy) {
+    return isFlexiNPUInt4ElementType(elemTy) ? 128 : 32;
+  }
+
+  static int64_t flexiGemmElemsPerRow(Type elemTy, int64_t tileDim) {
+    if (isFlexiNPUInt4ElementType(elemTy))
+      return (tileDim + 1) / 2;
+    return tileDim;
+  }
+
+  static flexinpu::FlexiNPUTypes flexiNpuDtypeForMatmul(
+      Operation *anchor, Type elemTy) {
+    auto dtype = convertFlexiNPUType(elemTy);
+    if (dtype != flexinpu::FlexiNPUTypes::i8)
+      return dtype;
+    if (auto target = IREE::HAL::ExecutableTargetAttr::lookup(anchor)) {
+      if (hasFlexiNPUInt4Feature(target.getConfiguration()))
+        return flexinpu::FlexiNPUTypes::i4;
+    }
+    return dtype;
   }
 
 struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> {
@@ -71,7 +101,8 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
                                          "illegal vecmat operand shapes");
     }
 
-    const int64_t DIM = 32; // TODO
+    const int64_t DIM = flexiTileDim(A.getElementType());
+    const int64_t GEMM_ROW = flexiGemmElemsPerRow(A.getElementType(), DIM);
 
     int64_t dim_M = 1;
     int64_t dim_N = B.getShape()[1];
@@ -96,8 +127,8 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
     Value oncAddrD = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
                                                        rewriter.getI64IntegerAttr(ONC_INTERVAL * 3));
 
-    auto dtype = convertFlexiNPUType(A.getElementType());
-    auto res_dtype = convertFlexiNPUType(C.getElementType());
+    auto dtype = flexiNpuDtypeForMatmul(vecmatOp, A.getElementType());
+    auto res_dtype = flexiNpuDtypeForMatmul(vecmatOp, C.getElementType());
 
     rewriter.create<flexinpu::DmaLoadOp>(
         loc, vecC,
@@ -135,7 +166,7 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
     rewriter.create<flexinpu::PreloadOp>(
         loc,
         oncAddrC, // oncPtr = onc_addr_mat_c
-        DIM, // elemsPerRow = n_access + n_pad = dim
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         flexinpu::FlexiNPUMatTypes::C, // matType = MAT_C
         res_dtype // type = mat_c_dtype
@@ -145,7 +176,7 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
     rewriter.create<flexinpu::PreloadOp>(
         loc,
         oncAddrB, // oncPtr = onc_addr_mat_b
-        DIM, // elemsPerRow = n_access + n_pad = dim
+        GEMM_ROW, // elemsPerRow
         dim_N, // rows = k_access
         flexinpu::FlexiNPUMatTypes::B, // matType = MAT_B
         dtype // type = mat_b_dtype
@@ -155,7 +186,7 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
         loc,
         rewriter.getI32Type(),
         oncAddrA, // oncPtr = onc_addr_mat_a
-        DIM, // elemsPerRow = k_access + k_pad
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         flexinpu::FlexiNPUMatTypes::A, // matType = MAT_A
         dtype, // type = mat_a_dtype
@@ -164,7 +195,7 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
 
     rewriter.create<flexinpu::FlushOp>(
         loc, oncAddrD,
-        DIM, // elemsPerRow = DIM
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         flexinpu::FlexiNPUMatTypes::D, // matType = MAT_D
         res_dtype // type = res_dtype
@@ -173,7 +204,7 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
     rewriter.create<flexinpu::DmaStoreOp>(
         loc, vecC,
         oncAddrD,
-        DIM, // elemsPerRow = DIM
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         cRowStride, // stride = N
         false, // trans = false
@@ -211,7 +242,8 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
                                          "expected static operand shapes");
     }
 
-    const int64_t DIM = 32; // TODO
+    const int64_t DIM = flexiTileDim(A.getElementType());
+    const int64_t GEMM_ROW = flexiGemmElemsPerRow(A.getElementType(), DIM);
 
     int64_t dim_M = A.getShape()[0];
     int64_t dim_K = A.getShape()[1];
@@ -246,8 +278,8 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
     Value oncAddrD = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
                                                        rewriter.getI64IntegerAttr(ONC_INTERVAL * 3));
 
-    auto dtype = convertFlexiNPUType(A.getElementType());
-    auto res_dtype = convertFlexiNPUType(C.getElementType());
+    auto dtype = flexiNpuDtypeForMatmul(matmulOp, A.getElementType());
+    auto res_dtype = flexiNpuDtypeForMatmul(matmulOp, C.getElementType());
 
     rewriter.create<flexinpu::DmaLoadOp>(
         loc, matC,
@@ -285,7 +317,7 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
     rewriter.create<flexinpu::PreloadOp>(
         loc,
         oncAddrC, // oncPtr = onc_addr_mat_c
-        DIM, // elemsPerRow = n_access + n_pad = dim
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         flexinpu::FlexiNPUMatTypes::C, // matType = MAT_C
         res_dtype // type = mat_c_dtype
@@ -295,7 +327,7 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
     rewriter.create<flexinpu::PreloadOp>(
         loc,
         oncAddrB, // oncPtr = onc_addr_mat_b
-        DIM, // elemsPerRow = n_access + n_pad = dim
+        GEMM_ROW, // elemsPerRow
         dim_N, // rows = k_access
         flexinpu::FlexiNPUMatTypes::B, // matType = MAT_B
         dtype // type = mat_b_dtype
@@ -305,7 +337,7 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
         loc,
         rewriter.getI32Type(),
         oncAddrA, // oncPtr = onc_addr_mat_a
-        DIM, // elemsPerRow = k_access + k_pad
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         flexinpu::FlexiNPUMatTypes::A, // matType = MAT_A
         dtype, // type = mat_a_dtype
@@ -314,7 +346,7 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
 
     rewriter.create<flexinpu::FlushOp>(
         loc, oncAddrD,
-        DIM, // elemsPerRow = DIM
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         flexinpu::FlexiNPUMatTypes::D, // matType = MAT_D
         res_dtype // type = res_dtype
@@ -323,7 +355,7 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
     rewriter.create<flexinpu::DmaStoreOp>(
         loc, matC,
         oncAddrD,
-        DIM, // elemsPerRow = DIM
+        GEMM_ROW, // elemsPerRow
         dim_M, // rows = m_access
         cRowStride, // stride = N
         false, // trans = false

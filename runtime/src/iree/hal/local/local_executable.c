@@ -9,6 +9,9 @@
 #include "iree/base/internal/atomics.h"
 #include "iree/hal/local/executable_environment.h"
 
+#include <inttypes.h>
+#include <stdio.h>
+
 static iree_atomic_int64_t iree_hal_local_executable_next_profile_id =
     IREE_ATOMIC_VAR_INIT(1);
 
@@ -99,6 +102,10 @@ iree_status_t iree_hal_local_executable_issue_dispatch_inline(
 
   iree_status_t status = iree_ok_status();
 
+  printf("[IREE][issue] begin ordinal=%u wg=%ux%ux%u\n", (uint32_t)ordinal,
+         workgroup_count_x, workgroup_count_y, workgroup_count_z);
+  fflush(stdout);
+
   iree_alignas(64) iree_hal_executable_workgroup_state_v0_t workgroup_state = {
       .workgroup_id_x = 0,
       .workgroup_id_y = 0,
@@ -120,6 +127,10 @@ iree_status_t iree_hal_local_executable_issue_dispatch_inline(
       }
     }
   }
+
+  printf("[IREE][issue] end ordinal=%u status=%d\n", (uint32_t)ordinal,
+         iree_status_code(status));
+  fflush(stdout);
 
   IREE_TRACE_ZONE_END(z0);
   return status;

@@ -131,8 +131,12 @@ void injectFlexiNPURocc(OpBuilder &builder, Location loc, Value rs1, Value rs2,
 }
 
 flexinpu::FlexiNPUTypes convertFlexiNPUType(Type type) {
-  if (type.isInteger(8))
-    return flexinpu::FlexiNPUTypes::i8; // INT8
+  if (auto intType = dyn_cast<IntegerType>(type)) {
+    if (intType.getWidth() == 4)
+      return flexinpu::FlexiNPUTypes::i4;
+    if (intType.getWidth() == 8)
+      return flexinpu::FlexiNPUTypes::i8; // INT8
+  }
   if (type.isInteger(32))
     return flexinpu::FlexiNPUTypes::i32;   // INT32
   if (type.isInteger(64))

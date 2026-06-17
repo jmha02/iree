@@ -58,6 +58,9 @@ bool hasI8mmFeature(DictionaryAttr targetConfig);
 /// Returns true if the 'targetAttr' contains '+flexinpu' in its cpu features.
 bool hasFlexiNPUFeature(DictionaryAttr targetConfig);
 
+/// Returns true if the 'targetAttr' contains '+flexinpu-int4' in its cpu features.
+bool hasFlexiNPUInt4Feature(DictionaryAttr targetConfig);
+
 /// Returns true if the `genericOp` is a simple 2D transpose, i.e.,
 ///
 ///   1. The op has 2 dimensions.

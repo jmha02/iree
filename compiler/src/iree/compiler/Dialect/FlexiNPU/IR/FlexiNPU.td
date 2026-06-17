@@ -30,13 +30,14 @@ def FlexiNPU_Dialect : Dialect {
 //===----------------------------------------------------------------------===//
 // FlexiNPU Attribute Definitions
 //===----------------------------------------------------------------------===//
-def FlexiNPUTypeI8 : I32EnumAttrCase<"i8", 0>;
-def FlexiNPUTypeI32 : I32EnumAttrCase<"i32", 1>;
-def FlexiNPUTypeI64 : I32EnumAttrCase<"i64", 2>;
-def FlexiNPUTypeF16: I32EnumAttrCase<"f16", 3>;
-def FlexiNPUTypeF32: I32EnumAttrCase<"f32", 4>;
-def FlexiNPUTypeF64: I32EnumAttrCase<"f64", 5>;
-def FlexiNPUTypeBF16: I32EnumAttrCase<"bf16", 6>;
+def FlexiNPUTypeI4 : I32EnumAttrCase<"i4", 0>;
+def FlexiNPUTypeI8 : I32EnumAttrCase<"i8", 1>;
+def FlexiNPUTypeI32 : I32EnumAttrCase<"i32", 2>;
+def FlexiNPUTypeI64 : I32EnumAttrCase<"i64", 3>;
+def FlexiNPUTypeF16: I32EnumAttrCase<"f16", 4>;
+def FlexiNPUTypeF32: I32EnumAttrCase<"f32", 5>;
+def FlexiNPUTypeF64: I32EnumAttrCase<"f64", 6>;
+def FlexiNPUTypeBF16: I32EnumAttrCase<"bf16", 7>;
 
 def FlexiNPUMatTypeA: I32EnumAttrCase<"A", 0>;
 def FlexiNPUMatTypeB: I32EnumAttrCase<"B", 1>;
@@ -47,7 +48,7 @@ def FlexiNPUMatTypeD: I32EnumAttrCase<"D", 3>;
 //===----------------------------------------------------------------------===//
 
 def FlexiNPUTypesAttr: I32EnumAttr<"FlexiNPUTypes", "FlexiNPU Types", [
-  FlexiNPUTypeI8, FlexiNPUTypeI32, FlexiNPUTypeI64, FlexiNPUTypeF16,
+  FlexiNPUTypeI4, FlexiNPUTypeI8, FlexiNPUTypeI32, FlexiNPUTypeI64, FlexiNPUTypeF16,
   FlexiNPUTypeF32, FlexiNPUTypeF64, FlexiNPUTypeBF16
 ]> {
   let cppNamespace = "::flexinpu";

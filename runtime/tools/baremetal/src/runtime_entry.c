@@ -32,6 +32,11 @@ typedef struct {
 
 static iree_baremetal_runtime_state_t g_runtime_state = {0};
 
+static void iree_baremetal_marker(const char* label) {
+  printf("[IREE][marker] %s\n", label);
+  fflush(stdout);
+}
+
 static iree_status_t iree_baremetal_check_status(const char* label,
                                                  iree_status_t status) {
   if (!iree_status_is_ok(status)) {
@@ -250,6 +255,7 @@ static iree_status_t iree_baremetal_create_buffer_from_span(
 static iree_status_t iree_baremetal_initialize(
     const iree_baremetal_bundle_spec_t* spec,
     iree_allocator_t host_allocator) {
+  iree_baremetal_marker("initialize.begin");
   IREE_RETURN_IF_ERROR(iree_baremetal_check_status(
       "vm_instance_create",
       iree_vm_instance_create(IREE_VM_TYPE_CAPACITY_DEFAULT, host_allocator,
@@ -310,10 +316,12 @@ static iree_status_t iree_baremetal_initialize(
                                        spec->entry_function,
                                        &g_runtime_state.entry_function)));
   g_runtime_state.initialized = true;
+  iree_baremetal_marker("initialize.end");
   return iree_ok_status();
 }
 
 iree_status_t iree_baremetal_run(const iree_baremetal_bundle_spec_t* spec) {
+  iree_baremetal_marker("run.begin");
   if (!spec) {
     return iree_make_status(IREE_STATUS_INVALID_ARGUMENT, "spec is null");
   }
@@ -328,6 +336,7 @@ iree_status_t iree_baremetal_run(const iree_baremetal_bundle_spec_t* spec) {
                                            spec->input_count, host_allocator,
                                            &inputs));
 
+  iree_baremetal_marker("inputs.begin");
   for (iree_host_size_t i = 0; i < spec->input_count; ++i) {
     const iree_baremetal_input_t* input = &spec->inputs[i];
     switch (input->kind) {
@@ -364,19 +373,23 @@ iree_status_t iree_baremetal_run(const iree_baremetal_bundle_spec_t* spec) {
                                 "unsupported input kind %d", (int)input->kind);
     }
   }
+  iree_baremetal_marker("inputs.end");
 
   iree_vm_list_t* outputs = NULL;
   IREE_RETURN_IF_ERROR(iree_vm_list_create(iree_vm_make_undefined_type_def(),
                                            spec->output_count, host_allocator,
                                            &outputs));
 
+  iree_baremetal_marker("invoke.begin");
   iree_status_t status =
       iree_vm_invoke(g_runtime_state.context, g_runtime_state.entry_function,
                      IREE_VM_INVOCATION_FLAG_NONE, /*policy=*/NULL, inputs,
                      outputs, host_allocator);
+  iree_baremetal_marker("invoke.end");
   status = iree_baremetal_check_status("vm_invoke", status);
 
   if (iree_status_is_ok(status)) {
+    iree_baremetal_marker("outputs.begin");
     for (iree_host_size_t i = 0; i < spec->output_count; ++i) {
       const iree_baremetal_output_t* output = &spec->outputs[i];
       if (!output->result_buffer.data || output->result_buffer.data_length == 0) {
@@ -396,6 +409,7 @@ iree_status_t iree_baremetal_run(const iree_baremetal_bundle_spec_t* spec) {
       status = iree_baremetal_check_status("device_transfer_d2h", status);
       if (!iree_status_is_ok(status)) break;
     }
+    iree_baremetal_marker("outputs.end");
     if (iree_status_is_ok(status)) {
       iree_baremetal_print_outputs(spec);
     }
@@ -403,16 +417,19 @@ iree_status_t iree_baremetal_run(const iree_baremetal_bundle_spec_t* spec) {
 
   iree_vm_list_release(outputs);
   iree_vm_list_release(inputs);
+  iree_baremetal_marker("run.end");
   return status;
 }
 
 int main(void) {
+  iree_baremetal_marker("main.begin");
   __asm__ volatile("li t0, 0x1E600\n"
                    "csrs mstatus, t0\n"
                    ::: "t0");
 
   const iree_baremetal_bundle_spec_t* spec = iree_baremetal_acquire_spec();
   const iree_status_t status = iree_baremetal_run(spec);
+  iree_baremetal_marker("main.after_run");
   int exit_code = (int)iree_status_code(status);
   if (!iree_status_is_ok(status)) {
     iree_status_fprint(stderr, status);

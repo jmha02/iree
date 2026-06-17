@@ -8,6 +8,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "iree/async/frontier.h"
@@ -78,6 +79,23 @@ typedef struct iree_hal_sync_device_t {
   iree_host_size_t loader_count;
   iree_hal_executable_loader_t* loaders[];
 } iree_hal_sync_device_t;
+
+static void iree_hal_sync_device_dispatch_marker(const char* phase,
+                                                 uint32_t ordinal,
+                                                 iree_hal_dispatch_config_t config,
+                                                 iree_host_size_t bindings) {
+  printf("[IREE][dispatch] %s ordinal=%u wg=%ux%ux%u bindings=%" PRIhsz "\n",
+         phase, ordinal, config.workgroup_count[0],
+         config.workgroup_count[1], config.workgroup_count[2], bindings);
+  fflush(stdout);
+}
+
+static void iree_hal_sync_device_queue_marker(const char* phase,
+                                              iree_hal_command_buffer_t* command_buffer) {
+  printf("[IREE][queue] %s command_buffer=%s\n", phase,
+         command_buffer ? "present" : "null");
+  fflush(stdout);
+}
 
 static const iree_hal_device_vtable_t iree_hal_sync_device_vtable;
 
@@ -787,8 +805,10 @@ static iree_status_t iree_hal_sync_device_profiled_queue_op_begin(
     iree_hal_sync_device_profile_operation_t* operation) {
   iree_hal_sync_device_profile_operation_record_begin(
       device, wait_semaphore_list, signal_semaphore_list, operation);
+  iree_hal_sync_device_queue_marker("dispatch.wait.begin", NULL);
   IREE_RETURN_IF_ERROR(
       iree_hal_sync_device_queue_op_begin(device, wait_semaphore_list));
+  iree_hal_sync_device_queue_marker("dispatch.wait.end", NULL);
   if (IREE_UNLIKELY(
           operation->submission_id != 0 &&
           iree_hal_local_profile_recorder_is_enabled(
@@ -1388,9 +1408,15 @@ static iree_status_t iree_hal_sync_device_queue_dispatch(
   }
   IREE_RETURN_IF_ERROR(
       iree_hal_sync_device_queue_op_begin(device, wait_semaphore_list));
+  iree_hal_sync_device_dispatch_marker(
+      "begin", iree_hal_executable_function_index(export_ordinal), config,
+      bindings.count);
   iree_status_t status = iree_hal_local_executable_dispatch_inline(
       executable, export_ordinal, config, constants, bindings.values,
       bindings.count, flags);
+  iree_hal_sync_device_dispatch_marker(
+      "end", iree_hal_executable_function_index(export_ordinal), config,
+      bindings.count);
   return iree_hal_sync_device_queue_op_end(device, signal_semaphore_list,
                                            status);
 }
@@ -1535,10 +1561,12 @@ static iree_status_t iree_hal_sync_device_apply_deferred_command_buffer(
     iree_hal_sync_device_t* device, iree_hal_command_buffer_t* command_buffer,
     iree_hal_buffer_binding_table_t binding_table,
     const iree_hal_sync_device_command_buffer_profile_t* profile) {
+  iree_hal_sync_device_queue_marker("apply.begin", command_buffer);
   // If there were no deferred command buffers no-op this call - they've already
   // been issued.
   if (!command_buffer ||
       !iree_hal_deferred_command_buffer_isa(command_buffer)) {
+    iree_hal_sync_device_queue_marker("apply.skip", command_buffer);
     return iree_ok_status();
   }
 
@@ -1585,6 +1613,7 @@ static iree_status_t iree_hal_sync_device_apply_deferred_command_buffer(
       command_buffer, inline_command_buffer, binding_table);
 
   iree_hal_inline_command_buffer_deinitialize(inline_command_buffer);
+  iree_hal_sync_device_queue_marker("apply.end", command_buffer);
   return status;
 }
 
@@ -1634,10 +1663,14 @@ static iree_status_t iree_hal_sync_device_queue_execute(
         device, wait_semaphore_list, signal_semaphore_list, command_buffer,
         binding_table, flags);
   }
+  iree_hal_sync_device_queue_marker("execute.wait.begin", command_buffer);
   IREE_RETURN_IF_ERROR(
       iree_hal_sync_device_queue_op_begin(device, wait_semaphore_list));
+  iree_hal_sync_device_queue_marker("execute.wait.end", command_buffer);
+  iree_hal_sync_device_queue_marker("execute.begin", command_buffer);
   iree_status_t status = iree_hal_sync_device_apply_deferred_command_buffer(
       device, command_buffer, binding_table, /*profile=*/NULL);
+  iree_hal_sync_device_queue_marker("execute.end", command_buffer);
   return iree_hal_sync_device_queue_op_end(device, signal_semaphore_list,
                                            status);
 }
