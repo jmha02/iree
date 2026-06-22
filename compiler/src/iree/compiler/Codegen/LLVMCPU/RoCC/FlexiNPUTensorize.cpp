@@ -107,6 +107,55 @@ namespace {
     return -1;
   }
 
+  static Value castFloatValue(PatternRewriter &rewriter, Location loc, Value value,
+                              Type dstType) {
+    Type srcType = value.getType();
+    if (srcType == dstType)
+      return value;
+    unsigned srcWidth = srcType.getIntOrFloatBitWidth();
+    unsigned dstWidth = dstType.getIntOrFloatBitWidth();
+    if (srcWidth < dstWidth)
+      return rewriter.create<arith::ExtFOp>(loc, dstType, value);
+    return rewriter.create<arith::TruncFOp>(loc, dstType, value);
+  }
+
+  static void copyAndCast2D(PatternRewriter &rewriter, Location loc, Value src,
+                            Value dst, Type dstElemTy, int64_t rows,
+                            int64_t cols, bool accumulate) {
+    Value c0 = rewriter.create<arith::ConstantIndexOp>(loc, 0);
+    Value c1 = rewriter.create<arith::ConstantIndexOp>(loc, 1);
+    Value rowEnd = rewriter.create<arith::ConstantIndexOp>(loc, rows);
+    Value colEnd = rewriter.create<arith::ConstantIndexOp>(loc, cols);
+
+    auto rowLoop = rewriter.create<scf::ForOp>(loc, c0, rowEnd, c1);
+    {
+      OpBuilder::InsertionGuard rowGuard(rewriter);
+      rewriter.setInsertionPointToStart(rowLoop.getBody());
+      Value row = rowLoop.getInductionVar();
+      auto colLoop = rewriter.create<scf::ForOp>(loc, c0, colEnd, c1);
+      {
+        OpBuilder::InsertionGuard colGuard(rewriter);
+        rewriter.setInsertionPointToStart(colLoop.getBody());
+        Value col = colLoop.getInductionVar();
+        Value loaded = rewriter.create<memref::LoadOp>(loc, src, ValueRange{row, col});
+        Value casted = castFloatValue(rewriter, loc, loaded, dstElemTy);
+        if (accumulate) {
+          Value old =
+              rewriter.create<memref::LoadOp>(loc, dst, ValueRange{row, col});
+          casted = rewriter.create<arith::AddFOp>(loc, old, casted);
+        }
+        rewriter.create<memref::StoreOp>(loc, casted, dst, ValueRange{row, col});
+      }
+    }
+  }
+
+  static void fillZero(PatternRewriter &rewriter, Location loc, Value memref,
+                       Type elemTy) {
+    Value zero = rewriter.create<arith::ConstantOp>(
+        loc, elemTy, rewriter.getZeroAttr(elemTy));
+    rewriter.create<linalg::FillOp>(loc, ValueRange{zero}, ValueRange{memref});
+  }
+
   static bool isDimPair(AffineMap map, int64_t first, int64_t second) {
     if (map.getNumResults() != 2)
       return false;
@@ -182,7 +231,11 @@ namespace {
         rewriter.getI64IntegerAttr(ONC_INTERVAL * 3));
 
     auto dtype = flexiNpuDtypeForMatmul(anchor, A.getElementType());
-    auto res_dtype = flexiNpuDtypeForMatmul(anchor, C.getElementType());
+    bool useBf16ResultStaging =
+        A.getElementType().isBF16() && C.getElementType().isF32();
+    Type npuResultElemTy =
+        useBf16ResultStaging ? A.getElementType() : C.getElementType();
+    auto res_dtype = flexiNpuDtypeForMatmul(anchor, npuResultElemTy);
 
     for (int64_t m0 = 0; m0 < dim_M; m0 += DIM) {
       int64_t mAccess = std::min<int64_t>(DIM, dim_M - m0);
@@ -190,18 +243,36 @@ namespace {
         int64_t nAccess = std::min<int64_t>(DIM, dim_N - n0);
         int64_t pad_N = DIM - nAccess;
         Value cTile = subview2D(rewriter, loc, matC, m0, n0, mAccess, nAccess);
+        Value npuCTile = cTile;
+        int64_t npuCRowStride = cRowStride;
+        if (useBf16ResultStaging) {
+          auto tempType =
+              MemRefType::get({mAccess, nAccess}, npuResultElemTy);
+          npuCTile = rewriter.create<memref::AllocaOp>(loc, tempType);
+          npuCRowStride = nAccess;
+        } else {
+          rewriter.create<flexinpu::DmaLoadOp>(
+              loc, npuCTile, oncAddrC, nAccess, mAccess, npuCRowStride, false,
+              res_dtype, pad_N);
 
-        rewriter.create<flexinpu::DmaLoadOp>(
-            loc, cTile, oncAddrC, nAccess, mAccess, cRowStride, false,
-            res_dtype, pad_N);
-
-        rewriter.create<flexinpu::PreloadOp>(
-            loc, oncAddrC, GEMM_ROW, mAccess, flexinpu::FlexiNPUMatTypes::C,
-            res_dtype);
+          rewriter.create<flexinpu::PreloadOp>(
+              loc, oncAddrC, GEMM_ROW, mAccess, flexinpu::FlexiNPUMatTypes::C,
+              res_dtype);
+        }
 
         for (int64_t k0 = 0; k0 < dim_K; k0 += DIM) {
           int64_t kAccess = std::min<int64_t>(DIM, dim_K - k0);
           int64_t pad_K = DIM - kAccess;
+
+          if (useBf16ResultStaging) {
+            fillZero(rewriter, loc, npuCTile, npuResultElemTy);
+            rewriter.create<flexinpu::DmaLoadOp>(
+                loc, npuCTile, oncAddrC, nAccess, mAccess, npuCRowStride,
+                false, res_dtype, pad_N);
+            rewriter.create<flexinpu::PreloadOp>(
+                loc, oncAddrC, GEMM_ROW, mAccess,
+                flexinpu::FlexiNPUMatTypes::C, res_dtype);
+          }
 
           Value aTile = transposeA
                             ? subview2D(rewriter, loc, matA, k0, m0, kAccess,
@@ -231,15 +302,27 @@ namespace {
           rewriter.create<flexinpu::ExecuteS1Op>(
               loc, rewriter.getI32Type(), oncAddrA, GEMM_ROW, mAccess,
               flexinpu::FlexiNPUMatTypes::A, dtype, res_dtype);
+
+          if (useBf16ResultStaging) {
+            rewriter.create<flexinpu::FlushOp>(
+                loc, oncAddrD, GEMM_ROW, mAccess,
+                flexinpu::FlexiNPUMatTypes::D, res_dtype);
+            rewriter.create<flexinpu::DmaStoreOp>(
+                loc, npuCTile, oncAddrD, GEMM_ROW, mAccess, npuCRowStride,
+                false, res_dtype, pad_N);
+            copyAndCast2D(rewriter, loc, npuCTile, cTile, C.getElementType(),
+                          mAccess, nAccess, /*accumulate=*/true);
+          }
         }
 
-        rewriter.create<flexinpu::FlushOp>(
-            loc, oncAddrD, GEMM_ROW, mAccess, flexinpu::FlexiNPUMatTypes::D,
-            res_dtype);
-
-        rewriter.create<flexinpu::DmaStoreOp>(
-            loc, cTile, oncAddrD, GEMM_ROW, mAccess, cRowStride, false,
-            res_dtype, pad_N);
+        if (!useBf16ResultStaging) {
+          rewriter.create<flexinpu::FlushOp>(
+              loc, oncAddrD, GEMM_ROW, mAccess, flexinpu::FlexiNPUMatTypes::D,
+              res_dtype);
+          rewriter.create<flexinpu::DmaStoreOp>(
+              loc, npuCTile, oncAddrD, GEMM_ROW, mAccess, npuCRowStride, false,
+              res_dtype, pad_N);
+        }
       }
     }
 
