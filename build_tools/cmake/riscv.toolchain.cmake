@@ -108,10 +108,8 @@ elseif(RISCV_CPU STREQUAL "pk-riscv_64")
       "--riscv-v-fixed-length-vector-lmul-max=8"
       CACHE INTERNAL "Default llvm codegen flags for testing purposes")
 elseif(RISCV_CPU STREQUAL "generic-riscv_64")
-  # Specify ISP spec for march=rv64gc. This is to resolve the mismatch between
-  # llvm and binutil ISA version.
   set(RISCV_COMPILER_FLAGS "${RISCV_COMPILER_FLAGS} \
-      -march=rv64gc -mabi=lp64d -DIREE_PLATFORM_GENERIC=1 -DIREE_SYNCHRONIZATION_DISABLE_UNSAFE=1 \
+      -march=rv64gcv -mabi=lp64d -mcmodel=medany -DIREE_PLATFORM_GENERIC=1 -DIREE_SYNCHRONIZATION_DISABLE_UNSAFE=1 \
       -Wno-char-subscripts -Wno-unused-variable \
       -DIREE_FILE_IO_ENABLE=1 -DIREE_TIME_NOW_FN=\"\{ return 0; \}\" -DIREE_DEVICE_SIZE_T=uint64_t -DPRIdsz=PRIu64")
   set(RISCV_LINKER_FLAGS "${RISCV_LINKER_FLAGS} -lm")

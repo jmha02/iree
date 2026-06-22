@@ -93,6 +93,35 @@ static float iree_baremetal_bf16_to_f32(uint16_t value) {
   return conv.f32;
 }
 
+static float iree_baremetal_f16_to_f32(uint16_t value) {
+  uint32_t sign = ((uint32_t)value & 0x8000u) << 16;
+  uint32_t exp = ((uint32_t)value >> 10) & 0x1Fu;
+  uint32_t mant = (uint32_t)value & 0x03FFu;
+  uint32_t bits = 0;
+  if (exp == 0) {
+    if (mant == 0) {
+      bits = sign;
+    } else {
+      exp = 1;
+      while ((mant & 0x0400u) == 0) {
+        mant <<= 1;
+        --exp;
+      }
+      mant &= 0x03FFu;
+      bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7F800000u | (mant << 13);
+  } else {
+    bits = sign | ((exp + 112u) << 23) | (mant << 13);
+  }
+  union {
+    uint32_t u32;
+    float f32;
+  } conv = {.u32 = bits};
+  return conv.f32;
+}
+
 static void iree_baremetal_print_decimal(float value) {
   if (isnan(value)) {
     printf("nan");
@@ -160,6 +189,15 @@ static void iree_baremetal_print_tensor_values(
   if (limit == 0 || limit > element_count) limit = element_count;
 
   switch (output->element_type) {
+    case IREE_HAL_ELEMENT_TYPE_FLOAT_16: {
+      const uint16_t* values = (const uint16_t*)output->result_buffer.data;
+      for (iree_host_size_t i = 0; i < limit; ++i) {
+        printf("  [%5llu] ", (unsigned long long)i);
+        iree_baremetal_print_decimal(iree_baremetal_f16_to_f32(values[i]));
+        printf("\n");
+      }
+      break;
+    }
     case IREE_HAL_ELEMENT_TYPE_BFLOAT_16: {
       const uint16_t* values = (const uint16_t*)output->result_buffer.data;
       for (iree_host_size_t i = 0; i < limit; ++i) {

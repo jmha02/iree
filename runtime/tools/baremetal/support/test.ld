@@ -62,11 +62,13 @@ SECTIONS
   }
 
   /* bss segment */
+  _bss_start = .;
   .sbss : {
     *(.sbss .sbss.* .gnu.linkonce.sb.*)
     *(.scommon)
   }
   .bss : { *(.bss) }
+  _bss_end = .;
 
   /* thread-local data segment */
   .tdata :

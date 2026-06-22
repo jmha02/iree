@@ -144,6 +144,22 @@ static Value computeMemRefAddress(OpBuilder &builder, Location loc,
   return absAddr;
 }
 
+static void emitMemRefReadWriteTouch(OpBuilder &builder, Location loc,
+                                     Value memref) {
+  auto memrefTy = dyn_cast<MemRefType>(memref.getType());
+  if (!memrefTy)
+    return;
+
+  SmallVector<Value> indices;
+  indices.reserve(memrefTy.getRank());
+  for (int64_t i = 0; i < memrefTy.getRank(); ++i) {
+    indices.push_back(builder.create<arith::ConstantIndexOp>(loc, 0));
+  }
+
+  Value value = builder.create<memref::LoadOp>(loc, memref, indices);
+  builder.create<memref::StoreOp>(loc, value, memref, indices);
+}
+
 struct FlexiNPUDmaLoadOpPattern : public OpRewritePattern<flexinpu::DmaLoadOp> {
   using OpRewritePattern<flexinpu::DmaLoadOp>::OpRewritePattern;
 
@@ -458,6 +474,7 @@ struct FlexiNPUDmaStoreOpPattern : public OpRewritePattern<flexinpu::DmaStoreOp>
     argTypes.push_back(rewriter.getI1Type());     // trans
     argTypes.push_back(rewriter.getI32Type());    // dtype
     argTypes.push_back(rewriter.getI32Type());    // zero_pad
+    argTypes.push_back(op.getSrcOfcMemref().getType()); // touched destination memref
 
     auto funcType = rewriter.getFunctionType(argTypes, {});
     // auto funcName = "flexinpu_dma_store";
@@ -481,12 +498,14 @@ struct FlexiNPUDmaStoreOpPattern : public OpRewritePattern<flexinpu::DmaStoreOp>
       block->addArgument(rewriter.getI1Type(), op.getLoc());   // trans
       block->addArgument(rewriter.getI32Type(), op.getLoc());  // dtype
       block->addArgument(rewriter.getI32Type(), op.getLoc());  // zero_pad
+      block->addArgument(op.getSrcOfcMemref().getType(), op.getLoc()); // destination memref
       auto bodyBuilder = OpBuilder::atBlockEnd(block);
 
       // Use FlexiNPUDmaStore implementation
       FlexiNPUDmaStore storeImpl(bodyBuilder, op.getLoc(), elemsPerRow, rows, stride,
                                 trans ? 1 : 0, dtype, zeroPad);
       storeImpl.impl();
+      emitMemRefReadWriteTouch(bodyBuilder, op.getLoc(), block->getArgument(8));
 
       bodyBuilder.create<func::ReturnOp>(op.getLoc());
     }
@@ -510,6 +529,7 @@ struct FlexiNPUDmaStoreOpPattern : public OpRewritePattern<flexinpu::DmaStoreOp>
                                                        rewriter.getI32IntegerAttr(dtype)));       // dtype
     args.push_back(rewriter.create<arith::ConstantOp>(op.getLoc(), rewriter.getI32Type(),
                                                        rewriter.getI32IntegerAttr(zeroPad)));     // zero_pad
+    args.push_back(op.getSrcOfcMemref());                                // touched destination memref
 
     rewriter.create<func::CallOp>(op.getLoc(), funcOp, ValueRange(args));
     rewriter.eraseOp(op);

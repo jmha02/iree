@@ -1105,7 +1105,7 @@ public:
         ".insn r 0x7b, 0x3, " + std::to_string(funct) + ", x0, $0, $1";
     rewriter.create<LLVM::InlineAsmOp>(
         loc, TypeRange{}, ValueRange{rs1, rs2}, StringRef(asmStr),
-        /*constraints=*/StringRef("r,r"),
+        /*constraints=*/StringRef("r,r,~{memory}"),
         /*has_side_effects=*/true,
         /*is_align_stack=*/false,
         /*tail_call_kind=*/LLVM::tailcallkind::TailCallKind::None,

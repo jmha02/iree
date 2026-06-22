@@ -78,7 +78,7 @@ def FlexiNPU_DmaLoadOp : FlexiNPU_Op<"dmaload", [MemoryEffects<[MemRead, MemWrit
   }];
 
   let arguments = (ins
-    Arg<AnyMemRef, "", [MemWriteAt<0, FullEffect>]>:$srcOfcMemref,
+    Arg<AnyMemRef, "", [MemReadAt<0, FullEffect>]>:$srcOfcMemref,
     Arg<I64, "", []>:$oncPtr,
     I32Attr:$elems_per_row,
     I32Attr:$rows,
@@ -130,7 +130,7 @@ def FlexiNPU_PreloadOp : FlexiNPU_Op<"preload", [MemoryEffects<[MemRead, MemWrit
 
 }
 
-def FlexiNPU_ExecuteS1Op : FlexiNPU_Op<"execute_s1"> { // GEMM
+def FlexiNPU_ExecuteS1Op : FlexiNPU_Op<"execute_s1", [MemoryEffects<[MemRead, MemWrite]>]> { // GEMM
   let summary = "Matrix multiplication operation for variable-sized tiles";
   let description = [{
     Computes the product of two variable-sized tiles and produces a result with the same size.
@@ -161,7 +161,7 @@ def FlexiNPU_ExecuteS1Op : FlexiNPU_Op<"execute_s1"> { // GEMM
 
 }
 
-def FlexiNPU_DmaStoreOp : FlexiNPU_Op<"dmastore"> {
+def FlexiNPU_DmaStoreOp : FlexiNPU_Op<"dmastore", [MemoryEffects<[MemRead, MemWrite]>]> {
   let summary = "DMA store operation for storing a variable-sized tile";
   let description = [{
     Stores a variable-sized tile from the on-chip buffer back to memory.

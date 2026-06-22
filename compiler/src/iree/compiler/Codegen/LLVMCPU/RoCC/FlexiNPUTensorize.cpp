@@ -70,6 +70,182 @@ namespace {
     return dtype;
   }
 
+  static Value subview2D(PatternRewriter &rewriter, Location loc, Value source,
+                         int64_t offset0, int64_t offset1, int64_t size0,
+                         int64_t size1) {
+    SmallVector<OpFoldResult> offsets = {
+        rewriter.getIndexAttr(offset0), rewriter.getIndexAttr(offset1)};
+    SmallVector<OpFoldResult> sizes = {
+        rewriter.getIndexAttr(size0), rewriter.getIndexAttr(size1)};
+    SmallVector<OpFoldResult> strides = {
+        rewriter.getIndexAttr(1), rewriter.getIndexAttr(1)};
+    return rewriter.create<memref::SubViewOp>(loc, source, offsets, sizes,
+                                              strides).getResult();
+  }
+
+  static int64_t getConstStride(MemRefType ty, int dim) {
+    auto so = ty.getStridesAndOffset();
+    const auto &strides = so.first;
+    if (strides.empty())
+      return -1;
+    int64_t s = strides[dim];
+    return (s >= 1) ? s : -1;
+  }
+
+  static int64_t getStaticOrTiledDim(MemRefType ty, int dim) {
+    if (!ty.isDynamicDim(dim))
+      return ty.getDimSize(dim);
+    // IREE's inner tiled matmul can materialize as memref<32x?xT> with a
+    // fixed row stride equal to the inner N tile, e.g. layer3 N=196 -> 28.
+    // FlexiNPU commands need immediate tile sizes, so recover that bounded
+    // inner tile size from the row stride.
+    if (dim == 1) {
+      int64_t rowStride = getConstStride(ty, 0);
+      if (rowStride > 0 && rowStride <= 32)
+        return rowStride;
+    }
+    return -1;
+  }
+
+  static bool isDimPair(AffineMap map, int64_t first, int64_t second) {
+    if (map.getNumResults() != 2)
+      return false;
+    auto lhs = dyn_cast<AffineDimExpr>(map.getResult(0));
+    auto rhs = dyn_cast<AffineDimExpr>(map.getResult(1));
+    return lhs && rhs && lhs.getPosition() == first && rhs.getPosition() == second;
+  }
+
+  static LogicalResult emitTiledFlexiMatmul(
+      Operation *anchor, PatternRewriter &rewriter, Location loc, Value matA,
+      Value matB, Value matC, bool transposeA, bool transposeB) {
+    auto A = dyn_cast<MemRefType>(matA.getType());
+    auto B = dyn_cast<MemRefType>(matB.getType());
+    auto C = dyn_cast<MemRefType>(matC.getType());
+
+    if (!A || !B || !C) {
+      return rewriter.notifyMatchFailure(anchor, "expected memref operands");
+    }
+    if (A.getRank() != 2 || B.getRank() != 2 || C.getRank() != 2) {
+      return rewriter.notifyMatchFailure(anchor, "expected rank-2 operands");
+    }
+
+    const int64_t DIM = flexiTileDim(A.getElementType());
+    const int64_t GEMM_ROW = flexiGemmElemsPerRow(A.getElementType(), DIM);
+
+    int64_t cM = getStaticOrTiledDim(C, 0);
+    int64_t cN = getStaticOrTiledDim(C, 1);
+    int64_t dim_M =
+        transposeA ? getStaticOrTiledDim(A, 1) : getStaticOrTiledDim(A, 0);
+    int64_t dim_K_from_A =
+        transposeA ? getStaticOrTiledDim(A, 0) : getStaticOrTiledDim(A, 1);
+    int64_t dim_N =
+        transposeB ? getStaticOrTiledDim(B, 0) : getStaticOrTiledDim(B, 1);
+    int64_t dim_K_from_B =
+        transposeB ? getStaticOrTiledDim(B, 1) : getStaticOrTiledDim(B, 0);
+    if (dim_M < 1)
+      dim_M = cM;
+    if (dim_N < 1)
+      dim_N = cN;
+    if (dim_K_from_A < 1)
+      dim_K_from_A = dim_K_from_B;
+    if (dim_K_from_B < 1)
+      dim_K_from_B = dim_K_from_A;
+    if (dim_M < 1 || dim_N < 1 || dim_K_from_A < 1 || dim_K_from_B < 1 ||
+        cM < 1 || cN < 1) {
+      return rewriter.notifyMatchFailure(anchor,
+                                         "could not recover static tile sizes");
+    }
+    if (dim_K_from_A != dim_K_from_B || cM != dim_M || cN != dim_N) {
+      return rewriter.notifyMatchFailure(anchor,
+                                         "illegal logical matmul shapes");
+    }
+
+    int64_t dim_K = dim_K_from_A;
+    auto aRowStride = getConstStride(A, 0);
+    auto bRowStride = getConstStride(B, 0);
+    auto cRowStride = getConstStride(C, 0);
+    if (aRowStride < 1 || bRowStride < 1 || cRowStride < 1) {
+      return rewriter.notifyMatchFailure(anchor, "dynamic/invalid row stride");
+    }
+
+    int64_t ONC_INTERVAL = 1024 * 1024; // 1048576
+
+    Value oncAddrA = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(0));
+    Value oncAddrB = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64Type(), rewriter.getI64IntegerAttr(ONC_INTERVAL));
+    Value oncAddrC = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64Type(),
+        rewriter.getI64IntegerAttr(ONC_INTERVAL * 2));
+    Value oncAddrD = rewriter.create<arith::ConstantOp>(
+        loc, rewriter.getI64Type(),
+        rewriter.getI64IntegerAttr(ONC_INTERVAL * 3));
+
+    auto dtype = flexiNpuDtypeForMatmul(anchor, A.getElementType());
+    auto res_dtype = flexiNpuDtypeForMatmul(anchor, C.getElementType());
+
+    for (int64_t m0 = 0; m0 < dim_M; m0 += DIM) {
+      int64_t mAccess = std::min<int64_t>(DIM, dim_M - m0);
+      for (int64_t n0 = 0; n0 < dim_N; n0 += DIM) {
+        int64_t nAccess = std::min<int64_t>(DIM, dim_N - n0);
+        int64_t pad_N = DIM - nAccess;
+        Value cTile = subview2D(rewriter, loc, matC, m0, n0, mAccess, nAccess);
+
+        rewriter.create<flexinpu::DmaLoadOp>(
+            loc, cTile, oncAddrC, nAccess, mAccess, cRowStride, false,
+            res_dtype, pad_N);
+
+        rewriter.create<flexinpu::PreloadOp>(
+            loc, oncAddrC, GEMM_ROW, mAccess, flexinpu::FlexiNPUMatTypes::C,
+            res_dtype);
+
+        for (int64_t k0 = 0; k0 < dim_K; k0 += DIM) {
+          int64_t kAccess = std::min<int64_t>(DIM, dim_K - k0);
+          int64_t pad_K = DIM - kAccess;
+
+          Value aTile = transposeA
+                            ? subview2D(rewriter, loc, matA, k0, m0, kAccess,
+                                        mAccess)
+                            : subview2D(rewriter, loc, matA, m0, k0, mAccess,
+                                        kAccess);
+          Value bTile = transposeB
+                            ? subview2D(rewriter, loc, matB, n0, k0, nAccess,
+                                        kAccess)
+                            : subview2D(rewriter, loc, matB, k0, n0, kAccess,
+                                        nAccess);
+
+          rewriter.create<flexinpu::DmaLoadOp>(
+              loc, bTile, oncAddrB, transposeB ? kAccess : nAccess,
+              transposeB ? nAccess : kAccess, bRowStride, !transposeB, dtype,
+              pad_K);
+
+          rewriter.create<flexinpu::DmaLoadOp>(
+              loc, aTile, oncAddrA, transposeA ? mAccess : kAccess,
+              transposeA ? kAccess : mAccess, aRowStride, transposeA, dtype,
+              pad_K);
+
+          rewriter.create<flexinpu::PreloadOp>(
+              loc, oncAddrB, GEMM_ROW, nAccess, flexinpu::FlexiNPUMatTypes::B,
+              dtype);
+
+          rewriter.create<flexinpu::ExecuteS1Op>(
+              loc, rewriter.getI32Type(), oncAddrA, GEMM_ROW, mAccess,
+              flexinpu::FlexiNPUMatTypes::A, dtype, res_dtype);
+        }
+
+        rewriter.create<flexinpu::FlushOp>(
+            loc, oncAddrD, GEMM_ROW, mAccess, flexinpu::FlexiNPUMatTypes::D,
+            res_dtype);
+
+        rewriter.create<flexinpu::DmaStoreOp>(
+            loc, cTile, oncAddrD, GEMM_ROW, mAccess, cRowStride, false,
+            res_dtype, pad_N);
+      }
+    }
+
+    return success();
+  }
+
 struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> {
   using OpRewritePattern<linalg::VecmatOp>::OpRewritePattern;
 
@@ -108,7 +284,11 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
     int64_t dim_N = B.getShape()[1];
     int64_t dim_K = B.getShape()[0];
 
-    // int64_t pad_M = 1; // not used
+    if (dim_K > DIM || dim_N > DIM) {
+      return rewriter.notifyMatchFailure(
+          vecmatOp, "vecmat FlexiNPU path does not yet tile large K/N");
+    }
+
     int64_t pad_N = std::max<int64_t>(0, DIM - dim_N);
     int64_t pad_K = std::max<int64_t>(0, DIM - dim_K);
 
@@ -137,7 +317,7 @@ struct LinalgVecmatToFlexiNPUPattern: public OpRewritePattern<linalg::VecmatOp> 
         dim_M, // rows = MIN(DIM, K - DIM * k)
         cRowStride, // stride = N
         false, // trans = true
-        dtype, // dtype = mat_c_dtype
+        res_dtype, // dtype = mat_c_dtype
         pad_N
     );
 
@@ -228,140 +408,38 @@ struct LinalgMatmulToFlexiNPUPattern : public OpRewritePattern<linalg::MatmulOp>
     Value matB = matmulOp.getInputs()[1];
     Value matC = matmulOp.getOutputs()[0];
 
-    auto A = dyn_cast<MemRefType>(matA.getType());
-    auto B = dyn_cast<MemRefType>(matB.getType());
-    auto C = dyn_cast<MemRefType>(matC.getType());
+    bool transposeA = false;
+    bool transposeB = false;
+    auto maps = matmulOp.getIndexingMapsArray();
+    if (maps.size() == 3) {
+      if (isDimPair(maps[0], 0, 2)) {
+        transposeA = false;
+      } else if (isDimPair(maps[0], 2, 0)) {
+        transposeA = true;
+      } else {
+        return rewriter.notifyMatchFailure(matmulOp,
+                                           "unsupported A indexing map");
+      }
 
-    if (!A || !B || !C) {
-      return rewriter.notifyMatchFailure(matmulOp,
-                                         "expected memref operands");
+      if (isDimPair(maps[1], 2, 1)) {
+        transposeB = false;
+      } else if (isDimPair(maps[1], 1, 2)) {
+        transposeB = true;
+      } else {
+        return rewriter.notifyMatchFailure(matmulOp,
+                                           "unsupported B indexing map");
+      }
+
+      if (!isDimPair(maps[2], 0, 1)) {
+        return rewriter.notifyMatchFailure(matmulOp,
+                                           "unsupported C indexing map");
+      }
     }
 
-    if (!A.hasStaticShape() || !B.hasStaticShape() || !C.hasStaticShape()) {
-      return rewriter.notifyMatchFailure(matmulOp,
-                                         "expected static operand shapes");
+    if (failed(emitTiledFlexiMatmul(matmulOp, rewriter, loc, matA, matB, matC,
+                                    transposeA, transposeB))) {
+      return failure();
     }
-
-    const int64_t DIM = flexiTileDim(A.getElementType());
-    const int64_t GEMM_ROW = flexiGemmElemsPerRow(A.getElementType(), DIM);
-
-    int64_t dim_M = A.getShape()[0];
-    int64_t dim_K = A.getShape()[1];
-    int64_t dim_N = B.getShape()[1];
-
-    int64_t pad_N = std::max<int64_t>(0, DIM - dim_N);
-    int64_t pad_K = std::max<int64_t>(0, DIM - dim_K);
-
-    auto getConstStride = [&](MemRefType ty, int dim) -> int64_t {
-      auto so = ty.getStridesAndOffset();
-      const auto &strides = so.first;
-      if (strides.empty()) return -1;
-      int64_t s = strides[dim];
-      return (s >= 1) ? s : -1;
-    };
-
-    auto aRowStride = getConstStride(A, 0); // K
-    auto bRowStride = getConstStride(B, 0); // N
-    auto cRowStride = getConstStride(C, 0); // N
-    if (aRowStride < 1 || bRowStride < 1 || cRowStride < 1) {
-      return rewriter.notifyMatchFailure(matmulOp, "dynamic/invalid row stride");
-    }
-
-    int64_t ONC_INTERVAL = 1024 * 1024; // 1048576
-
-    Value oncAddrA = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
-                                                       rewriter.getI64IntegerAttr(0));
-    Value oncAddrB = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
-                                                       rewriter.getI64IntegerAttr(ONC_INTERVAL));
-    Value oncAddrC = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
-                                                       rewriter.getI64IntegerAttr(ONC_INTERVAL * 2));
-    Value oncAddrD = rewriter.create<arith::ConstantOp>(loc, rewriter.getI64Type(),
-                                                       rewriter.getI64IntegerAttr(ONC_INTERVAL * 3));
-
-    auto dtype = flexiNpuDtypeForMatmul(matmulOp, A.getElementType());
-    auto res_dtype = flexiNpuDtypeForMatmul(matmulOp, C.getElementType());
-
-    rewriter.create<flexinpu::DmaLoadOp>(
-        loc, matC,
-        oncAddrC,
-        dim_N, // elemsPerRow = MIN(DIM, N - DIM * n)
-        dim_M, // rows = MIN(DIM, K - DIM * k)
-        cRowStride, // stride = N
-        false, // trans = true
-        dtype, // dtype = mat_c_dtype
-        pad_N
-    );
-
-    rewriter.create<flexinpu::DmaLoadOp>(
-        loc, matB,
-        oncAddrB, // oncPtr = onc_addr_mat_b
-        dim_N, // n_access
-        dim_K, // k_access
-        bRowStride, // stride = N
-        true, // trans = true
-        dtype, // dtype = mat_b_dtype
-        pad_K
-    );
-
-    rewriter.create<flexinpu::DmaLoadOp>(
-        loc, matA,
-        oncAddrA, // oncPtr = onc_addr_mat_a
-        dim_K, // elemsPerRow = k_access
-        dim_M, // rows = m_access
-        aRowStride, // stride = K
-        false, // trans = false
-        dtype, // dtype = mat_a_dtype
-        pad_K
-    );
-
-    rewriter.create<flexinpu::PreloadOp>(
-        loc,
-        oncAddrC, // oncPtr = onc_addr_mat_c
-        GEMM_ROW, // elemsPerRow
-        dim_M, // rows = m_access
-        flexinpu::FlexiNPUMatTypes::C, // matType = MAT_C
-        res_dtype // type = mat_c_dtype
-      );
-
-
-    rewriter.create<flexinpu::PreloadOp>(
-        loc,
-        oncAddrB, // oncPtr = onc_addr_mat_b
-        GEMM_ROW, // elemsPerRow
-        dim_N, // rows = k_access
-        flexinpu::FlexiNPUMatTypes::B, // matType = MAT_B
-        dtype // type = mat_b_dtype
-    );
-
-    rewriter.create<flexinpu::ExecuteS1Op>(
-        loc,
-        rewriter.getI32Type(),
-        oncAddrA, // oncPtr = onc_addr_mat_a
-        GEMM_ROW, // elemsPerRow
-        dim_M, // rows = m_access
-        flexinpu::FlexiNPUMatTypes::A, // matType = MAT_A
-        dtype, // type = mat_a_dtype
-        res_dtype // res_type = res_dtype
-    );
-
-    rewriter.create<flexinpu::FlushOp>(
-        loc, oncAddrD,
-        GEMM_ROW, // elemsPerRow
-        dim_M, // rows = m_access
-        flexinpu::FlexiNPUMatTypes::D, // matType = MAT_D
-        res_dtype // type = res_dtype
-    );
-
-    rewriter.create<flexinpu::DmaStoreOp>(
-        loc, matC,
-        oncAddrD,
-        GEMM_ROW, // elemsPerRow
-        dim_M, // rows = m_access
-        cRowStride, // stride = N
-        false, // trans = false
-        res_dtype, // type = mat_d_dtype
-        pad_N
-    );
 
     rewriter.eraseOp(matmulOp);
     return success();

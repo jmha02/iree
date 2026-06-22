@@ -87,9 +87,9 @@ public:
    *   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
    *     ((uint64_t)(onc_addr) << 38) | ((uint64_t)(ofc_addr) >> 10), \
    *     ((uint64_t)(ofc_addr)  << 54) | \
-   *     ((uint64_t)(zero_pad)  << 41) | \
-   *     ((uint64_t)(dtype)     << 38) | \
-   *     ((uint64_t)(trans)     << 37) | \
+   *     ((uint64_t)(zero_pad)  << 44) | \
+   *     ((uint64_t)(dtype)     << 41) | \
+   *     ((uint64_t)(trans)     << 40) | \
    *     ((uint64_t)(stride)    << 27) | \
    *     ((uint64_t)(total_row) << 17) | \
    *     ((uint64_t)(row_numel) << 7)  | \
@@ -130,9 +130,9 @@ public:
                         .cat(rowNumelVal, 7)
                         .cat(totalRowVal, 17)
                         .cat(strideVal, 27)
-                        .cat(transVal, 37)
-                        .cat(dtypeVal, 38)
-                        .cat(zeroPadVal, 41);
+                        .cat(transVal, 40)
+                        .cat(dtypeVal, 41)
+                        .cat(zeroPadVal, 44);
 
     Value rs2 = builder.create<arith::OrIOp>(loc, ofcAddrUpper, rs2Lower);
 
@@ -366,9 +366,9 @@ public:
    *   ROCC_INSTRUCTION_RS1_RS2(XCUSTOM_ACC, \
    *     ((uint64_t)(onc_addr) << 38) | ((uint64_t)(ofc_addr) >> 10), \
    *     ((uint64_t)(ofc_addr)  << 54) | \
-   *     ((uint64_t)(zero_pad)  << 41) | \
-   *     ((uint64_t)(dtype)     << 38) | \
-   *     ((uint64_t)(trans)     << 37) | \
+   *     ((uint64_t)(zero_pad)  << 44) | \
+   *     ((uint64_t)(dtype)     << 41) | \
+   *     ((uint64_t)(trans)     << 40) | \
    *     ((uint64_t)(stride)    << 27) | \
    *     ((uint64_t)(total_row) << 17) | \
    *     ((uint64_t)(row_numel) << 7)  | \
@@ -407,9 +407,9 @@ public:
                         .cat(rowNumelVal, 7)
                         .cat(totalRowVal, 17)
                         .cat(strideVal, 27)
-                        .cat(transVal, 37)
-                        .cat(dtypeVal, 38)
-                        .cat(zeroPadVal, 41);
+                        .cat(transVal, 40)
+                        .cat(dtypeVal, 41)
+                        .cat(zeroPadVal, 44);
 
     Value rs2 = builder.create<arith::OrIOp>(loc, ofcAddrUpper, rs2Lower);
 

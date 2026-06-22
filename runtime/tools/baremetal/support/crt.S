@@ -118,6 +118,16 @@ _start:
   la gp, __global_pointer$
 .option pop
 
+  # Zero .bss before entering C/C++ runtime code.
+  la t0, _bss_start
+  la t1, _bss_end
+1:
+  bgeu t0, t1, 2f
+  SREG zero, 0(t0)
+  addi t0, t0, REGBYTES
+  j 1b
+2:
+
   la  tp, _end + 63
   and tp, tp, -64
 
