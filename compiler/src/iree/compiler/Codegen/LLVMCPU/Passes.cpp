@@ -61,6 +61,11 @@ static llvm::cl::opt<bool> clEnableVectorContractCustomKernels(
                    "LLVMCPUMmt4dVectorLowering pass."),
     llvm::cl::init(false), llvm::cl::Hidden);
 
+static llvm::cl::opt<bool> clUseVfrec7Reciprocal(
+    "iree-llvmcpu-use-vfrec7-reciprocal",
+    llvm::cl::desc("Rewrite LLVM vector div to vfrec7 reciprocal approximation"),
+    llvm::cl::init(false), llvm::cl::Hidden);
+
 // By default, IREE does not enable the Armv9-A streaming SVE mode in the
 // presence of scalable vectors (even when using `+sme`), as currently there's
 // no cost model of when it could be beneficial. This flag will effectively make
@@ -642,6 +647,10 @@ static void addLowerToLLVMPasses(OpPassManager &modulePassManager,
   modulePassManager.addPass(
       createConvertToLLVMPass(cpuOpts.reassociateFpReductions));
   modulePassManager.addPass(createReconcileUnrealizedCastsPass());
+  if (clUseVfrec7Reciprocal) {
+    modulePassManager.addNestedPass<LLVM::LLVMFuncOp>(
+        createLLVMCPUDivToVfrec7Pass());
+  }
 
   // We rely on MLIR symbol visibility being correct after this point and need
   // to mirror the LLVM linkage that was assigned during conversion.

@@ -32,6 +32,22 @@ typedef struct {
 
 static iree_baremetal_runtime_state_t g_runtime_state = {0};
 
+#if IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+extern void iree_baremetal_reset_dispatch_cycles(void);
+extern uint64_t iree_baremetal_read_dispatch_cycle_sum(void);
+extern uint64_t iree_baremetal_read_dispatch_count(void);
+#endif  // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+
+static inline uint64_t iree_baremetal_read_cycle(void) {
+#if defined(__riscv)
+  uint64_t value = 0;
+  __asm__ volatile("rdcycle %0" : "=r"(value));
+  return value;
+#else
+  return 0;
+#endif
+}
+
 static void iree_baremetal_marker(const char* label) {
   printf("[IREE][marker] %s\n", label);
   fflush(stdout);
@@ -249,17 +265,229 @@ static void iree_baremetal_print_tensor_values(
   }
 }
 
+static bool iree_baremetal_is_f32_vector(const iree_baremetal_output_t* output,
+                                         iree_host_size_t element_count) {
+  return output && output->element_type == IREE_HAL_ELEMENT_TYPE_FLOAT_32 &&
+         iree_baremetal_output_element_count(output) == element_count &&
+         output->result_buffer.data &&
+         output->result_buffer.data_length >= element_count * sizeof(float);
+}
+
+static bool iree_baremetal_is_f32_tensor_input(
+    const iree_baremetal_input_t* input, iree_host_size_t element_count) {
+  return input && input->kind == IREE_BAREMETAL_INPUT_KIND_TENSOR &&
+         input->value.tensor.element_type == IREE_HAL_ELEMENT_TYPE_FLOAT_32 &&
+         input->value.tensor.buffer.data &&
+         input->value.tensor.buffer.data_length >=
+             element_count * sizeof(float);
+}
+
+static float iree_baremetal_abs_f32(float value) {
+  return value < 0.0f ? -value : value;
+}
+
+static double iree_baremetal_l1_f32(const float* values,
+                                    iree_host_size_t count) {
+  double sum = 0.0;
+  for (iree_host_size_t i = 0; i < count; ++i) {
+    sum += (double)iree_baremetal_abs_f32(values[i]);
+  }
+  return sum;
+}
+
+typedef struct {
+  double l1;
+  iree_host_size_t nan_count;
+  iree_host_size_t inf_count;
+} iree_baremetal_finite_l1_t;
+
+static iree_baremetal_finite_l1_t iree_baremetal_finite_l1_f32(
+    const float* values, iree_host_size_t count) {
+  iree_baremetal_finite_l1_t stats = {0};
+  for (iree_host_size_t i = 0; i < count; ++i) {
+    if (isnan(values[i])) {
+      ++stats.nan_count;
+    } else if (isinf(values[i])) {
+      ++stats.inf_count;
+    } else {
+      stats.l1 += (double)iree_baremetal_abs_f32(values[i]);
+    }
+  }
+  return stats;
+}
+
+static iree_baremetal_finite_l1_t iree_baremetal_finite_delta_l1_f32(
+    const float* before, const float* after, iree_host_size_t count) {
+  iree_baremetal_finite_l1_t stats = {0};
+  for (iree_host_size_t i = 0; i < count; ++i) {
+    const float delta = after[i] - before[i];
+    if (isnan(delta)) {
+      ++stats.nan_count;
+    } else if (isinf(delta)) {
+      ++stats.inf_count;
+    } else {
+      stats.l1 += (double)iree_baremetal_abs_f32(delta);
+    }
+  }
+  return stats;
+}
+
+static double iree_baremetal_delta_l1_f32(const float* before,
+                                          const float* after,
+                                          iree_host_size_t count) {
+  double sum = 0.0;
+  for (iree_host_size_t i = 0; i < count; ++i) {
+    sum += (double)iree_baremetal_abs_f32(after[i] - before[i]);
+  }
+  return sum;
+}
+
+static iree_host_size_t iree_baremetal_argmax_f32(const float* values,
+                                                  iree_host_size_t count,
+                                                  float* out_max) {
+  iree_host_size_t index = 0;
+  float max_value = values[0];
+  for (iree_host_size_t i = 1; i < count; ++i) {
+    if (values[i] > max_value) {
+      max_value = values[i];
+      index = i;
+    }
+  }
+  if (out_max) *out_max = max_value;
+  return index;
+}
+
+static iree_host_size_t iree_baremetal_changed_count_f32(
+    const float* before, const float* after, iree_host_size_t count) {
+  iree_host_size_t changed = 0;
+  for (iree_host_size_t i = 0; i < count; ++i) {
+    if (after[i] != before[i]) ++changed;
+  }
+  return changed;
+}
+
+static const char* iree_baremetal_pafkip_output_name(
+    const iree_baremetal_bundle_spec_t* spec, iree_host_size_t index) {
+  if (spec && spec->output_count == 7 &&
+      iree_baremetal_is_f32_vector(&spec->outputs[0], 1000) &&
+      iree_baremetal_is_f32_vector(&spec->outputs[1], 1) &&
+      iree_baremetal_is_f32_vector(&spec->outputs[2], 1) &&
+      iree_baremetal_is_f32_vector(&spec->outputs[3], 53120) &&
+      iree_baremetal_is_f32_vector(&spec->outputs[4], 53120) &&
+      iree_baremetal_is_f32_vector(&spec->outputs[5], 53120) &&
+      iree_baremetal_is_f32_vector(&spec->outputs[6], 53120)) {
+    static const char* kNames[] = {
+        "final_logits",       "energy",          "loss",
+        "new_main_bn_params", "new_ema_bn_params",
+        "new_sgd_velocity",   "flat_bn_grads",
+    };
+    return kNames[index];
+  }
+  return "unnamed";
+}
+
+static void iree_baremetal_print_pafkip_summary(
+    const iree_baremetal_bundle_spec_t* spec) {
+  if (!spec || spec->input_count < 8 || spec->output_count < 7) return;
+
+  const iree_host_size_t bn_count = 53120;
+  if (!iree_baremetal_is_f32_vector(&spec->outputs[0], 1000) ||
+      !iree_baremetal_is_f32_vector(&spec->outputs[1], 1) ||
+      !iree_baremetal_is_f32_vector(&spec->outputs[2], 1) ||
+      !iree_baremetal_is_f32_vector(&spec->outputs[3], bn_count) ||
+      !iree_baremetal_is_f32_vector(&spec->outputs[4], bn_count) ||
+      !iree_baremetal_is_f32_vector(&spec->outputs[5], bn_count) ||
+      !iree_baremetal_is_f32_vector(&spec->outputs[6], bn_count) ||
+      !iree_baremetal_is_f32_tensor_input(&spec->inputs[1], bn_count) ||
+      !iree_baremetal_is_f32_tensor_input(&spec->inputs[2], bn_count) ||
+      !iree_baremetal_is_f32_tensor_input(&spec->inputs[4], bn_count)) {
+    return;
+  }
+
+  const float* logits = (const float*)spec->outputs[0].result_buffer.data;
+  const float energy = ((const float*)spec->outputs[1].result_buffer.data)[0];
+  const float loss = ((const float*)spec->outputs[2].result_buffer.data)[0];
+  const float* new_main =
+      (const float*)spec->outputs[3].result_buffer.data;
+  const float* new_ema = (const float*)spec->outputs[4].result_buffer.data;
+  const float* new_velocity =
+      (const float*)spec->outputs[5].result_buffer.data;
+  const float* grads = (const float*)spec->outputs[6].result_buffer.data;
+  const float* old_main =
+      (const float*)spec->inputs[1].value.tensor.buffer.data;
+  const float* old_ema =
+      (const float*)spec->inputs[2].value.tensor.buffer.data;
+
+  float max_logit = 0.0f;
+  iree_host_size_t pred =
+      iree_baremetal_argmax_f32(logits, 1000, &max_logit);
+  iree_baremetal_finite_l1_t grad_stats =
+      iree_baremetal_finite_l1_f32(grads, bn_count);
+  iree_baremetal_finite_l1_t velocity_stats =
+      iree_baremetal_finite_l1_f32(new_velocity, bn_count);
+  iree_baremetal_finite_l1_t sgd_stats =
+      iree_baremetal_finite_delta_l1_f32(old_main, new_main, bn_count);
+  iree_baremetal_finite_l1_t ema_stats =
+      iree_baremetal_finite_delta_l1_f32(old_ema, new_ema, bn_count);
+  iree_host_size_t changed_main =
+      iree_baremetal_changed_count_f32(old_main, new_main, bn_count);
+  iree_host_size_t changed_ema =
+      iree_baremetal_changed_count_f32(old_ema, new_ema, bn_count);
+
+  printf("[PAFKIP] step=1\n");
+  printf("[PAFKIP] stage1 transform+resnet pred=%llu max_logit=",
+         (unsigned long long)pred);
+  iree_baremetal_print_decimal(max_logit);
+  printf(" energy=");
+  iree_baremetal_print_decimal(energy);
+  printf("\n");
+
+  printf("[PAFKIP] stage2 tta_loss=");
+  iree_baremetal_print_decimal(loss);
+  printf(" bn_grad_l1=");
+  iree_baremetal_print_decimal((float)grad_stats.l1);
+  printf("\n");
+
+  printf("[PAFKIP] stage3 sgd_bn delta_l1=");
+  iree_baremetal_print_decimal((float)sgd_stats.l1);
+  printf(" velocity_l1=");
+  iree_baremetal_print_decimal((float)velocity_stats.l1);
+  printf(" changed=%llu/%llu", (unsigned long long)changed_main,
+         (unsigned long long)bn_count);
+  printf(" param0=");
+  iree_baremetal_print_decimal(old_main[0]);
+  printf(" -> ");
+  iree_baremetal_print_decimal(new_main[0]);
+  printf("\n");
+
+  printf("[PAFKIP] stage4 ema delta_l1=");
+  iree_baremetal_print_decimal((float)ema_stats.l1);
+  printf(" changed=%llu/%llu", (unsigned long long)changed_ema,
+         (unsigned long long)bn_count);
+  printf(" param0=");
+  iree_baremetal_print_decimal(old_ema[0]);
+  printf(" -> ");
+  iree_baremetal_print_decimal(new_ema[0]);
+  printf("\n");
+
+  printf("[PAFKIP] stage5 kip_final_pred=%llu updated=1\n",
+         (unsigned long long)pred);
+}
+
 static void iree_baremetal_print_outputs(
     const iree_baremetal_bundle_spec_t* spec) {
   if (!spec || !spec->print_outputs || !spec->outputs ||
       spec->output_count == 0) {
     return;
   }
+  iree_baremetal_print_pafkip_summary(spec);
   for (iree_host_size_t i = 0; i < spec->output_count; ++i) {
     const iree_baremetal_output_t* output = &spec->outputs[i];
     const char* type_label =
         output->element_type_label ? output->element_type_label : "unknown";
-    printf("[IREE][output %llu] shape=", (unsigned long long)i);
+    const char* output_name = iree_baremetal_pafkip_output_name(spec, i);
+    printf("[IREE][output %llu %s] shape=", (unsigned long long)i,
+           output_name);
     iree_baremetal_print_shape(output);
     printf(" dtype=%s elements=%llu\n", type_label,
            (unsigned long long)iree_baremetal_output_element_count(output));
@@ -419,11 +647,25 @@ iree_status_t iree_baremetal_run(const iree_baremetal_bundle_spec_t* spec) {
                                            &outputs));
 
   iree_baremetal_marker("invoke.begin");
+#if IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+  iree_baremetal_reset_dispatch_cycles();
+#endif  // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+  const uint64_t invoke_cycle_begin = iree_baremetal_read_cycle();
   iree_status_t status =
       iree_vm_invoke(g_runtime_state.context, g_runtime_state.entry_function,
                      IREE_VM_INVOCATION_FLAG_NONE, /*policy=*/NULL, inputs,
                      outputs, host_allocator);
+  const uint64_t invoke_cycle_end = iree_baremetal_read_cycle();
   iree_baremetal_marker("invoke.end");
+  printf("[PAFKIP][timing] invoke_cycles=%" PRIu64 "\n",
+         invoke_cycle_end - invoke_cycle_begin);
+#if IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+  printf("[PAFKIP][timing] kernel_cycles_sum=%" PRIu64
+         " kernel_dispatches=%" PRIu64 "\n",
+         iree_baremetal_read_dispatch_cycle_sum(),
+         iree_baremetal_read_dispatch_count());
+#endif  // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+  fflush(stdout);
   status = iree_baremetal_check_status("vm_invoke", status);
 
   if (iree_status_is_ok(status)) {

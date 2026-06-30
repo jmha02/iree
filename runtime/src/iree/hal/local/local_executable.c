@@ -12,6 +12,38 @@
 #include <inttypes.h>
 #include <stdio.h>
 
+#if IREE_BAREMETAL_PRINT_DISPATCH_CYCLES || \
+    IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+static inline uint64_t iree_baremetal_read_cycle(void) {
+#if defined(__riscv)
+  uint64_t value = 0;
+  __asm__ volatile("rdcycle %0" : "=r"(value));
+  return value;
+#else
+  return 0;
+#endif
+}
+#endif  // IREE_BAREMETAL_PRINT_DISPATCH_CYCLES ||
+        // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+
+#if IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+uint64_t iree_baremetal_dispatch_cycle_sum = 0;
+uint64_t iree_baremetal_dispatch_count = 0;
+
+void iree_baremetal_reset_dispatch_cycles(void) {
+  iree_baremetal_dispatch_cycle_sum = 0;
+  iree_baremetal_dispatch_count = 0;
+}
+
+uint64_t iree_baremetal_read_dispatch_cycle_sum(void) {
+  return iree_baremetal_dispatch_cycle_sum;
+}
+
+uint64_t iree_baremetal_read_dispatch_count(void) {
+  return iree_baremetal_dispatch_count;
+}
+#endif  // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+
 static iree_atomic_int64_t iree_hal_local_executable_next_profile_id =
     IREE_ATOMIC_VAR_INIT(1);
 
@@ -108,6 +140,12 @@ iree_status_t iree_hal_local_executable_issue_dispatch_inline(
   fflush(stdout);
 #endif  // IREE_BAREMETAL_PRINT_DISPATCH_ISSUES
 
+#if IREE_BAREMETAL_PRINT_DISPATCH_CYCLES || \
+    IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+  const uint64_t dispatch_cycle_begin = iree_baremetal_read_cycle();
+#endif  // IREE_BAREMETAL_PRINT_DISPATCH_CYCLES ||
+        // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+
   iree_alignas(64) iree_hal_executable_workgroup_state_v0_t workgroup_state = {
       .workgroup_id_x = 0,
       .workgroup_id_y = 0,
@@ -129,6 +167,30 @@ iree_status_t iree_hal_local_executable_issue_dispatch_inline(
       }
     }
   }
+
+#if IREE_BAREMETAL_PRINT_DISPATCH_CYCLES || \
+    IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+  const uint64_t dispatch_cycle_end = iree_baremetal_read_cycle();
+  const uint64_t dispatch_cycles = dispatch_cycle_end - dispatch_cycle_begin;
+#endif  // IREE_BAREMETAL_PRINT_DISPATCH_CYCLES ||
+        // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+
+#if IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+  iree_baremetal_dispatch_cycle_sum += dispatch_cycles;
+  ++iree_baremetal_dispatch_count;
+#endif  // IREE_BAREMETAL_ACCUMULATE_DISPATCH_CYCLES
+
+#if IREE_BAREMETAL_PRINT_DISPATCH_CYCLES
+  iree_string_view_t export_name =
+      iree_hal_local_executable_export_name(executable,
+                                            iree_hal_executable_function_from_index(
+                                                (uint32_t)ordinal));
+  printf("[IREE][kernel] ordinal=%u cycles=%" PRIu64 " wg=%ux%ux%u name=%.*s\n",
+         (uint32_t)ordinal, dispatch_cycles, workgroup_count_x,
+         workgroup_count_y, workgroup_count_z, (int)export_name.size,
+         export_name.data);
+  fflush(stdout);
+#endif  // IREE_BAREMETAL_PRINT_DISPATCH_CYCLES
 
 #if IREE_BAREMETAL_PRINT_DISPATCH_ISSUES
   printf("[IREE][issue] end ordinal=%u status=%d\n", (uint32_t)ordinal,

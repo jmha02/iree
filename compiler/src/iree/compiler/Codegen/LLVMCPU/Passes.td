@@ -84,6 +84,12 @@ def LLVMCPUEmitVectorizationRemarksPass :
   let summary = "Emit vectorization remarks on Linalg ops";
 }
 
+def LLVMCPUDivToVfrec7Pass :
+    Pass<"iree-llvmcpu-div-to-vfrec7", "LLVM::LLVMFuncOp"> {
+  let summary = "Rewrite LLVM vector div to vfrec7 reciprocal approximation.";
+  let constructor = "mlir::iree_compiler::createLLVMCPUDivToVfrec7Pass()";
+}
+
 def LLVMCPULinkExecutablesPass :
     Pass<"iree-llvmcpu-link-executables", "mlir::ModuleOp"> {
   let summary = "Links LLVMCPU HAL executables within the top-level program module.";

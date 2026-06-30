@@ -50,6 +50,7 @@ iree_cc_library(
     "Utils.h"
   SRCS
     "ConvertToLLVM.cpp"
+    "ConvertDivToVfrec7.cpp"
     "DispatchABI.cpp"
     "ExpandF16OpToF32.cpp"
     "KernelDispatch.cpp"

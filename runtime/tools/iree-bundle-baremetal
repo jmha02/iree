@@ -726,6 +726,15 @@ def main():
         ),
     )
     parser.add_argument(
+        "--suppress-output-printing",
+        action="store_true",
+        help=(
+            "Capture output buffers but do not print output tensors. This is "
+            "useful for cycle measurements where UART output should not affect "
+            "wallclock runtime."
+        ),
+    )
+    parser.add_argument(
         "--runtime-root",
         default=os.environ.get("IREE_RT_BAREMETAL_DIR"),
         help="Path to IREE runtime build directory (bare-metal toolchain).",
@@ -901,7 +910,7 @@ def main():
             outputs,
             args.function,
             temp_dir,
-            print_outputs=bool(outputs),
+            print_outputs=bool(outputs) and not args.suppress_output_printing,
             print_limit=args.output_print_limit,
             runner=args.runner,
         )

@@ -19,6 +19,7 @@
 #include "iree/compiler/Codegen/Utils/CodegenOptions.h"
 #include "iree/compiler/Codegen/Utils/CodegenPipelineOptions.h"
 #include "iree/compiler/Dialect/HAL/IR/HALOps.h"
+#include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Pass/Pass.h"
 
 namespace mlir::iree_compiler {
@@ -58,6 +59,9 @@ createLLVMCPUVerifyVectorSizeLegalityPass(
 
 std::unique_ptr<OperationPass<ModuleOp>>
 createConvertToLLVMPass(bool reassociateFpReordering);
+
+std::unique_ptr<OperationPass<LLVM::LLVMFuncOp>>
+createLLVMCPUDivToVfrec7Pass();
 
 //------------------------------------------------------------------------------
 // LLVMCPU Codegen specific patterns.
